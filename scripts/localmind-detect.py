@@ -114,8 +114,13 @@ def detect_cpu() -> dict:
         key = key.strip().lower()
         val = val.strip()
         # x86: "model name"; ARM: "Model"/"Hardware"; ppc: "model"
-        if key in ("model name", "hardware") and not model and val:
-            model = val
+        if key in ("model name", "hardware", "model") and not model and val:
+            # "model" на x86 — числовой ревизии-идентификатор (0x...), не имя;
+            # берём его только когда это читаемое строковое имя (ARM/ppc)
+            if key == "model" and (val.startswith("0x") or val.isdigit()):
+                pass
+            else:
+                model = val
         if key == "processor":
             cores += 1
         if key == "cpu architecture" and arch in (None, STATUS_UNKNOWN):
@@ -139,6 +144,7 @@ def detect_memory() -> dict:
         return mem
     wanted = {"MemTotal": "mem_total_bytes", "MemAvailable": "mem_available_bytes"}
     found = False
+    parse_failed = False
     for line in lines:
         key, _, rest = line.partition(":")
         if key in wanted:
@@ -148,9 +154,35 @@ def detect_memory() -> dict:
                     mem[wanted[key]] = int(parts[0]) * 1024  # kB -> bytes
                     found = True
                 except ValueError:
-                    mem["status"] = STATUS_ERROR
-    mem["status"] = STATUS_DETECTED if found else STATUS_UNKNOWN
+                    # испорченное значение: error имеет приоритет над detected
+                    # (инженерная проверка B1: раньше status=detected при total=None)
+                    parse_failed = True
+    if parse_failed:
+        mem["status"] = STATUS_ERROR
+    elif found:
+        mem["status"] = STATUS_DETECTED
+    else:
+        mem["status"] = STATUS_UNKNOWN
     return mem
+
+
+# Обобщённые label-строки amdgpu: по ним нельзя отличить конкретную модель
+# (например, RX 7600 и iGPU дают одинаковый "AMD Radeon Graphics").
+GENERIC_MODEL_LABELS = ("AMD Radeon Graphics", "AMD ATI Radeon Graphics")
+
+
+def _model_status(model) -> str:
+    """Честный статус модели (инженерная проверка B2).
+
+    detected — только точное имя из таблицы subsystem-ID (проверяемое);
+    unknown  — обобщённый DRM label (не позволяет назвать модель);
+    unavailable — имени нет вовсе.
+    """
+    if model is None:
+        return STATUS_UNAVAILABLE
+    if any(g.lower() in model.lower() for g in GENERIC_MODEL_LABELS):
+        return STATUS_UNKNOWN
+    return STATUS_DETECTED
 
 
 def detect_drm_gpus() -> list[dict]:
@@ -205,11 +237,11 @@ def detect_drm_gpus() -> list[dict]:
             "driver": driver,
             "driver_status": STATUS_DETECTED if driver else STATUS_UNAVAILABLE,
             "model": read_file(os.path.join(base, "label")) or None,
-            "model_status": STATUS_DETECTED,
+            # v0.2 (инженерная проверка B2): label/таблица не дают точной модели —
+            # это предположение, а не подтверждение; final model — задача probe E3
             "pci_path": pci_path,
         }
-        if entry["model"] is None:
-            entry["model_status"] = STATUS_UNAVAILABLE
+        entry["model_status"] = _model_status(entry["model"])
         # render node (DRM renderD для Vulkan/compute-доступа к карте)
         entry["render_node"] = renders.get(pci_path)
         mem_info = read_file(os.path.join(base, "mem_info_vram_total"))
@@ -270,16 +302,31 @@ def detect_kfd_nodes() -> list[dict]:
         props = {}
         pfile = os.path.join(ndir, "properties")
         if os.path.isfile(pfile):
-            with open(pfile, "r", errors="replace") as fh:
-                for line in fh:
-                    parts = line.split()
-                    if len(parts) == 2:
-                        props[parts[0]] = parts[1]
-        entry = {"node": node}
+            # инженерная проверка B4: open() без обработки ошибок — на живой
+            # системе (не root) нечитаемый properties валился с traceback;
+            # теперь это честный status=error, детектор продолжает работу
+            try:
+                with open(pfile, "r", errors="replace") as fh:
+                    content = fh.read()
+            except OSError:
+                nodes.append({"node": node, "status": STATUS_ERROR})
+                continue
+        else:
+            content = ""
+        for line in content.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                props[parts[0]] = parts[1]
+        entry = {"node": node, "status": STATUS_DETECTED}
         if "name" in props:
             entry["name"] = props["name"]
         if "cpu_count" in props:
-            entry["cpu_count"] = int(props["cpu_count"])
+            try:
+                entry["cpu_count"] = int(props["cpu_count"])
+            except ValueError:
+                # повреждённое sysfs-значение (защита от нестабильности
+                # после обновлений ядра/ROCm): поле — unknown, не падение
+                entry["status"] = STATUS_ERROR
         # GPU-узел KFD отличается наличием vdhip/unique_id без cpu-ядер;
         # сохраняем сырые ключи, интерпретация — задача probe-слоя (E3).
         entry["raw_keys"] = sorted(props.keys())
@@ -401,8 +448,14 @@ def detect_stack_presence() -> dict:
     stacks["vulkaninfo_binary"] = bool(shutil.which("vulkaninfo"))
     stacks["tool_status"] = {
         "lspci": tool_status("lspci", ["lspci", "-nn"]),
-        "rocminfo": tool_status("rocminfo"),
-        "vulkaninfo": tool_status("vulkaninfo"),
+        # инженерная проверка: rocminfo/vulkaninfo без аргументов НЕ запускаем —
+        # rocminfo перечисляет устройства и может виснуть без /dev/kfd, это
+        # выходит за рамки read-only детектора; presence = availability bинаря,
+        # полноценный probe — слой E3/E4 (POLICY P4)
+        "rocminfo": (STATUS_DETECTED if stacks["rocminfo_binary"]
+                     else STATUS_UNAVAILABLE),
+        "vulkaninfo": (STATUS_DETECTED if stacks["vulkaninfo_binary"]
+                       else STATUS_UNAVAILABLE),
         "rocm_smi_lib": (STATUS_DETECTED
                          if glob.glob(os.path.join(sysfs_root(),
                               "opt/rocm*/lib/librocmsmi*"))
@@ -424,27 +477,33 @@ def detect_stack_presence() -> dict:
 def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
     """Связывает DRM-GPU с KFD-узлами по gfx-алиасам (in-place).
 
-    Метод корреляции: имя KFD-узла (gfxXXXX) сверяется с известными
-    архитектурами. Это эвристика v0; точная привязка по dev→node map —
-    задача probe-слоя E3 (там же — проверка прав доступа к /dev/kfd).
+    Инженерная проверка B3: раньше ANY известный gfx-алиас приписывался
+    EVERY AMD-карте — на смешанной системе вторая AMD-карта получала чужой
+    gfx и ложный compute_status=detected. Теперь алиасы распределяются по
+    одному разу; лишним AMD-картам — unknown (точное соответствие dev→node
+    даёт только probe E3 через /dev/kfd ioctl).
     """
     gfx_in_nodes = [n.get("name") for n in kfd if n.get("name")]
     known_gfx = [g for g in gfx_in_nodes if g in GFX_ALIASES]
-    for gpu in gpus:
-        if gpu["vendor_id"] != "0x1002":
-            continue
-        arch_guess = None
-        # дискретные RDNA2/RDNA3 имеют известные алиасы; iGPU часто без KFD
+    pool = list(known_gfx)  # каждый алиас можно использовать один раз
+    amd_cards = [gpu for gpu in gpus if gpu["vendor_id"] == "0x1002"]
+    # если AMD-карт столько же, сколько известных gfx-узлов, порядок cardN
+    # обычно совпадает с порядком узлов — но это эвристика v0, поэтому при
+    # неоднозначности (разные количества) распределение НЕ выполняем вовсе
+    exact = len(pool) == len(amd_cards)
+    for gpu in amd_cards:
         if gpu.get("device_id") in RDNA1_IGPU_NO_ROCM:
             gpu["kfd_node_present"] = False
-        elif known_gfx:
+        elif pool and exact:
+            gfx = pool.pop(0)
             gpu["kfd_node_present"] = True
-            gpu["kfd_gfx"] = known_gfx[0]
-            arch_guess = GFX_ALIASES.get(known_gfx[0])
+            gpu["kfd_gfx"] = gfx
+            gpu["architecture"] = GFX_ALIASES[gfx]
+        elif known_gfx:
+            # неоднозначно: KFD есть, но привязать к этой карте нельзя
+            gpu["kfd_node_present"] = dev_exists("dev/kfd")
         else:
             gpu["kfd_node_present"] = dev_exists("dev/kfd")
-        if arch_guess:
-            gpu["architecture"] = arch_guess
 
 
 def classify(gpus: list[dict], kfd: list[dict]) -> dict:

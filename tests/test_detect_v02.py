@@ -219,5 +219,94 @@ class TestRealEnvironment(unittest.TestCase):
             self.assertIn(g["compute_status"], ALL_STATUSES)
 
 
+
+class TestAuditFixes(unittest.TestCase):
+    """Регрессии инженерной проверки v0.2 (B1–B5, CPU-Model)."""
+
+    def _fixture(self, base: str) -> str:
+        tmp = self.mkdtemp()
+        fx = os.path.join(tmp, "fx")
+        import shutil
+        shutil.copytree(os.path.join(GOLDEN, base), fx, symlinks=True)
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return fx
+
+    def mkdtemp(self) -> str:
+        import tempfile
+        d = tempfile.mkdtemp()
+        return d
+
+    def test_B1_meminfo_corrupt_is_error_not_detected(self):
+        fx = self._fixture("fake-amd-kfd")
+        p = os.path.join(fx, "proc/meminfo")
+        with open(p) as fh:
+            txt = fh.read()
+        with open(p, "w") as fh:
+            fh.write(txt.replace("MemTotal:       32786544 kB",
+                                 "MemTotal:       broken kB"))
+        rep = report(fx)
+        self.assertEqual(rep["memory"]["status"], "error")
+        self.assertIsNone(rep["memory"]["mem_total_bytes"])
+
+    def test_B2_generic_label_model_status_unknown(self):
+        """Обобщённый DRM label != подтверждённая модель (было detected)."""
+        rep = report(os.path.join(GOLDEN, "fake-amd-no-vram"))
+        g = rep["drm_gpus"][0]
+        self.assertEqual(g["model"], "AMD Radeon Graphics")
+        self.assertEqual(g["model_status"], "unknown")
+
+    def test_B2_exact_subsystem_match_stays_detected(self):
+        rep = report(os.path.join(GOLDEN, "fake-amd-kfd"))
+        g = rep["drm_gpus"][0]
+        self.assertEqual(g["model"], "Radeon RX 7900 XTX")
+        self.assertEqual(g["model_status"], "detected")
+
+    def test_B3_no_kfd_cross_attribution_two_amd_cards(self):
+        """Две AMD-карты и один gfx-узел: алиас НЕ раздаётся обеим."""
+        import shutil, tempfile
+        tmp = tempfile.mkdtemp(); fx = os.path.join(tmp, "fx")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        shutil.copytree(os.path.join(GOLDEN, "fake-multi-gpu"), fx, symlinks=True)
+        d = os.path.join(fx, "sys/class/drm/card1/device")
+        with open(os.path.join(d, "vendor"), "w") as fh:
+            fh.write("0x1002\n")
+        with open(os.path.join(d, "device"), "w") as fh:
+            fh.write("0x1636\n")
+        kdir = os.path.join(fx, "sys/devices/virtual/kfd/kfd/topology/nodes/1")
+        os.makedirs(kdir, exist_ok=True)
+        with open(os.path.join(kdir, "properties"), "w") as fh:
+            fh.write("name gfx1100\nunique_id 1\n")
+        os.makedirs(os.path.join(fx, "dev"), exist_ok=True)
+        open(os.path.join(fx, "dev/kfd"), "w").close()
+        rep = report(fx)
+        amd = [g for g in rep["drm_gpus"] if g["vendor_id"] == "0x1002"]
+        # ни одна карта не получила ложный detected при неоднозначной корреляции
+        self.assertNotIn("detected", [g["compute_status"] for g in amd])
+        self.assertNotIn("gfx1100", [g.get("kfd_gfx") for g in amd])
+
+    def test_B5_arm_model_line_and_x86_numeric_guard(self):
+        import shutil, tempfile
+        tmp = tempfile.mkdtemp(); fx = os.path.join(tmp, "fx")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        shutil.copytree(os.path.join(GOLDEN, "fake-amd-kfd"), fx, symlinks=True)
+        with open(os.path.join(fx, "proc/cpuinfo"), "w") as fh:
+            fh.write("Features\t: fp asimd\nModel\t: ARMv8 Processor rev 4\n"
+                     "processor\t: 0\nprocessor\t: 1\n")
+        rep = report(fx)
+        self.assertEqual(rep["cpu"]["model"], "ARMv8 Processor rev 4")
+        self.assertEqual(rep["cpu"]["cores"], 2)
+        # x86: числовая строка "model : 8" не должна перекрывать model name
+        fx2 = os.path.join(tmp, "fx2")
+        shutil.copytree(os.path.join(GOLDEN, "fake-amd-kfd"), fx2, symlinks=True)
+        p = os.path.join(fx2, "proc/cpuinfo")
+        with open(p) as fh:
+            txt = fh.read()
+        with open(p, "w") as fh:
+            fh.write(txt + "\nmodel\t\t: 8\n")
+        rep2 = report(fx2)
+        self.assertIn("Ryzen", rep2["cpu"]["model"])
+
+
+
 if __name__ == "__main__":
     unittest.main()
