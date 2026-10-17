@@ -185,13 +185,18 @@ def _model_status(model) -> str:
     return STATUS_DETECTED
 
 
-def detect_drm_gpus() -> list[dict]:
+def detect_drm_gpus(subsystem_names: dict | None = None) -> list[dict]:
     """Карта DRM-устройств из /sys/class/drm (только чтение).
 
     Каждый GPU получает явные статусы полей (vram/driver/model) и
     compute_status — предварительную оценку вычислительной готовности.
     unsupported/unknown здесь НЕ означает FAIL probe: финальный verdict
     выдаёт только probe-слой (E3/E4) на реальном железе.
+
+    Раунд 3 (D2): subsystem_names (ключ vendor:device:subsys_v:subsys_d)
+    уточняет модель ДО корреляции с KFD — раньше таблица применялась в
+    build_report после correlate, и точное имя модели никогда не попадало
+    ни в render_node-сопоставление, ни в golden-проверки по подсистемам.
     """
     gpus = []
     drm_dir = os.path.join(sysfs_root(), "sys/class/drm")
@@ -237,10 +242,27 @@ def detect_drm_gpus() -> list[dict]:
             "driver": driver,
             "driver_status": STATUS_DETECTED if driver else STATUS_UNAVAILABLE,
             "model": read_file(os.path.join(base, "label")) or None,
-            # v0.2 (инженерная проверка B2): label/таблица не дают точной модели —
-            # это предположение, а не подтверждение; final model — задача probe E3
+            # v0.2 (инженерная проверка B2): label без точного совпадения в
+            # таблице подсистем — предположение, а не подтверждение;
+            # final model — задача probe E3
             "pci_path": pci_path,
         }
+        # D2: точное имя из таблицы subsystem-ID имеет приоритет над DRM-label
+        if subsystem_names:
+            subs_v = read_file(os.path.join(base, "subsystem_vendor"))
+            subs_d = read_file(os.path.join(base, "subsystem_device"))
+            if subs_v is not None and subs_d is not None:
+                try:
+                    skey = (f"0x{int(subs_v, 16) & 0xFFFF:04x}:"
+                            f"0x{int(subs_d, 16) & 0xFFFF:04x}")
+                except ValueError:
+                    skey = None
+                if skey:
+                    full_key = f"{entry['vendor_id']}:{entry['device_id']}:{skey}"
+                    name = subsystem_names.get(full_key)
+                    if name:
+                        entry["model"] = name
+                        entry["subsystem_key"] = full_key
         entry["model_status"] = _model_status(entry["model"])
         # render node (DRM renderD для Vulkan/compute-доступа к карте)
         entry["render_node"] = renders.get(pci_path)
@@ -570,18 +592,9 @@ def build_report() -> dict:
         kernel_release = os.uname().release
     except AttributeError:
         pass
-    gpus = detect_drm_gpus()
+    gpus = detect_drm_gpus(detect_subsystem_names())  # D2: модель известна до correlate
     kfd = detect_kfd_nodes()
     correlate_kfd_to_gpus(gpus, kfd)
-    names = detect_subsystem_names()
-    for g in gpus:
-        key = f"{g['vendor_id']}:{g['device_id']}"
-        # уточнение модели по subsystem-паре, если она есть в таблице
-        for k, name in names.items():
-            if k.startswith(key + ":"):
-                g["model"] = name
-                g["model_status"] = STATUS_DETECTED
-                break
     # compute_status пересчитывается ПОСЛЕ корреляции с KFD (v0.2: порядок
     # вызовов — ошибка ревью; в v0.1 статус считался до появления kfd_gfx)
     for g in gpus:

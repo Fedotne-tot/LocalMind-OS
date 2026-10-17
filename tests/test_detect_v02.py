@@ -387,6 +387,64 @@ class TestAuditRound2(unittest.TestCase):
         self.assertIn("os_pretty_name", rep)
 
 
+class TestAuditRound3(unittest.TestCase):
+    """Регрессии третьей инженерной проверки (D1–D4)."""
+
+    def test_D1_multi_gpu_amd_resolved_by_subsystem_table(self):
+        """D1: фикстура multi-gpu обязана называть RX 7800 XT.
+
+        Раньше model оставался None, потому что таблица подсистем
+        применялась только к DRM-label-строке и после correlate; теперь
+        уточнение выполняется внутри detect_drm_gpus до корреляции.
+        """
+        fx = os.path.join(GOLDEN, "fake-multi-gpu")
+        dev = os.path.join(fx, "sys/class/drm/card0/device")
+        with open(os.path.join(dev, "subsystem_vendor"), "w") as fh:
+            fh.write("0x0732\n")
+        with open(os.path.join(dev, "subsystem_device"), "w") as fh:
+            fh.write("0x0008\n")
+        rep = report(fx)
+        amd = next(g for g in rep["drm_gpus"] if g["vendor_id"] == "0x1002")
+        self.assertEqual(amd["model"], "Radeon RX 7800 XT")
+        self.assertEqual(amd["model_status"], "detected")
+        self.assertEqual(amd.get("subsystem_key"),
+                         "0x1002:0x7480:0x0732:0x0008")
+        # NVIDIA-карта при этом остаётся unknown (не наша задача на этом слое)
+        nv = next(g for g in rep["drm_gpus"] if g["vendor_id"] == "0x10de")
+        self.assertEqual(nv["compute_status"], "unknown")
+
+    def test_D2_model_known_before_kfd_correlation(self):
+        """D2: точная модель доступна уже на выходе detect_drm_gpus."""
+        fx = os.path.join(GOLDEN, "fake-amd-kfd")
+        old_env = os.environ.get("LM_FAKE_SYS")
+        os.environ["LM_FAKE_SYS"] = fx  # фикстура вместо голой среды CI (без GPU)
+        try:
+            names = lmd.detect_subsystem_names()
+            gpus = lmd.detect_drm_gpus(names)
+        finally:
+            if old_env is None:
+                os.environ.pop("LM_FAKE_SYS", None)
+            else:
+                os.environ["LM_FAKE_SYS"] = old_env
+        amd = next(g for g in gpus if g["vendor_id"] == "0x1002")
+        self.assertEqual(amd["model"], "Radeon RX 7900 XTX")
+        self.assertEqual(amd["model_status"], "detected")
+
+    def test_D3_generic_label_never_claimed_detected(self):
+        """D3: обобщённый label 'AMD Radeon Graphics' = unknown, не detected."""
+        self.assertEqual(lmd._model_status("AMD Radeon Graphics"), "unknown")
+        self.assertEqual(lmd._model_status("Radeon RX 7800 XT"), "detected")
+        self.assertEqual(lmd._model_status(None), "unavailable")
+
+    def test_D4_no_pass_string_in_any_fixture_report(self):
+        """D4: ни один golden-отчёт не содержит строку PASS (страховка P4)."""
+        for fx in sorted(os.listdir(GOLDEN)):
+            rep = report(os.path.join(GOLDEN, fx))
+            blob = json.dumps(rep)
+            self.assertNotIn('"PASS"', blob)
+            self.assertNotIn("supported\": true", blob)
+
+
 
 if __name__ == "__main__":
     unittest.main()
