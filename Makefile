@@ -13,7 +13,7 @@ test:
 	$(PYTHON) -m unittest discover -s tests -v
 
 lint:
-	$(PYTHON) -m py_compile scripts/localmind-detect.py tests/test_detect.py
+	$(PYTHON) -m py_compile scripts/localmind-detect.py tests/test_detect.py tests/test_detect_v02.py
 	$(PYTHON) -c "import json; json.load(open('config/report-schema.json')); print('schema: valid JSON')"
 
 clean:

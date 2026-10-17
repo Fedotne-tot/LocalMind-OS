@@ -20,8 +20,9 @@
 ## Быстрый старт (только чтение оборудования, без установки чего-либо)
 
 ```bash
-./localmind-detect --json > report.json   # отчёт об оборудовании
-./localmind-detect                        # человекочитаемый вывод
+./localmind-detect --json > report.json   # отчёт об оборудовании (schema 0.2.0)
+./localmind-detect                        # человекочитаемый вывод: CPU/RAM/GPU
+./localmind-detect --doctor               # первичная диагностика GPU
 ```
 
 Детектор работает только на чтение (`lspci`, `/sys`, `/dev`) и ничего не устанавливает.

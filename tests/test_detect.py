@@ -40,7 +40,7 @@ class TestSchemaShape(unittest.TestCase):
             schema = json.load(fh)
         for key in schema["required"]:
             self.assertIn(key, report, f"missing {key}")
-        self.assertEqual(report["schema_version"], "0.1.0")
+        self.assertEqual(report["schema_version"], "0.2.0")
 
     def test_policy_block_immutable(self):
         report = run_detect(os.path.join(GOLDEN, "fake-amd-kfd"))
