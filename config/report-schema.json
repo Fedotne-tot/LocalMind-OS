@@ -1,0 +1,359 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "localmind-report-0.2.0",
+  "title": "LocalMind OS hardware report v0.2",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "tool_version",
+    "generated_at_utc",
+    "hostname",
+    "os_pretty_name",
+    "kernel_release",
+    "cpu",
+    "memory",
+    "drm_gpus",
+    "kfd_nodes",
+    "lspci_display",
+    "loaded_modules",
+    "stacks",
+    "classification",
+    "policy"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "const": "0.2.0"
+    },
+    "tool_version": {
+      "type": "string"
+    },
+    "generated_at_utc": {
+      "type": "string"
+    },
+    "hostname": {
+      "type": "string"
+    },
+    "os_pretty_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kernel_release": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "drm_gpus": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "card",
+          "vendor_id",
+          "device_id",
+          "vendor",
+          "driver_status",
+          "vram_status",
+          "model_status",
+          "compute_status"
+        ],
+        "properties": {
+          "card": {
+            "type": "string"
+          },
+          "vendor_id": {
+            "type": "string",
+            "pattern": "^0x[0-9a-f]{4}$"
+          },
+          "device_id": {
+            "type": "string",
+            "pattern": "^0x[0-9a-f]{4}$"
+          },
+          "vendor": {
+            "type": "string"
+          },
+          "driver": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "vram_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "driver_status": {
+            "enum": [
+              "detected",
+              "unavailable",
+              "unknown",
+              "unsupported",
+              "error"
+            ]
+          },
+          "vram_status": {
+            "enum": [
+              "detected",
+              "unavailable",
+              "unknown",
+              "unsupported",
+              "error"
+            ]
+          },
+          "model_status": {
+            "enum": [
+              "detected",
+              "unavailable",
+              "unknown",
+              "unsupported",
+              "error"
+            ]
+          },
+          "compute_status": {
+            "enum": [
+              "detected",
+              "unavailable",
+              "unknown",
+              "unsupported",
+              "error"
+            ]
+          },
+          "render_node": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pci_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "architecture": {
+            "type": "string"
+          },
+          "kfd_gfx": {
+            "type": "string"
+          },
+          "kfd_node_present": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "kfd_nodes": {
+      "type": "array"
+    },
+    "lspci_display": {
+      "type": "array"
+    },
+    "stacks": {
+      "type": "object",
+      "required": [
+        "rocminfo_binary",
+        "vulkaninfo_binary",
+        "vulkan_icd_dirs_present"
+      ],
+      "properties": {
+        "rocm_install_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rocm_version_file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rocminfo_binary": {
+          "type": "boolean"
+        },
+        "vulkaninfo_binary": {
+          "type": "boolean"
+        },
+        "vulkan_icd_dirs_present": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tool_status": {
+          "type": "object",
+          "required": [
+            "lspci",
+            "rocminfo",
+            "vulkaninfo"
+          ],
+          "properties": {
+            "lspci": {
+              "enum": [
+                "detected",
+                "unavailable",
+                "unknown",
+                "unsupported",
+                "error"
+              ]
+            },
+            "rocminfo": {
+              "enum": [
+                "detected",
+                "unavailable",
+                "unknown",
+                "unsupported",
+                "error"
+              ]
+            },
+            "vulkaninfo": {
+              "enum": [
+                "detected",
+                "unavailable",
+                "unknown",
+                "unsupported",
+                "error"
+              ]
+            },
+            "rocm_smi_lib": {
+              "enum": [
+                "detected",
+                "unavailable",
+                "unknown",
+                "unsupported",
+                "error"
+              ]
+            }
+          }
+        },
+        "radv_icd_files": {
+          "type": "boolean"
+        }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "required": [
+        "amd_gpu_detected",
+        "kfd_device_present",
+        "preliminary_verdict"
+      ],
+      "properties": {
+        "amd_gpu_detected": {
+          "type": "boolean"
+        },
+        "amdgpu_driver_bound": {
+          "type": "boolean"
+        },
+        "kfd_device_present": {
+          "type": "boolean"
+        },
+        "known_gfx_aliases_in_kfd": {
+          "type": "array"
+        },
+        "preliminary_verdict": {
+          "enum": [
+            "ROCM_CANDIDATE",
+            "VULKAN_ONLY_CANDIDATE",
+            "NO_AMD_GPU"
+          ]
+        },
+        "note": {
+          "type": "string"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "required": [
+        "gpu_strict_default",
+        "silent_cpu_fallback"
+      ],
+      "properties": {
+        "gpu_strict_default": {
+          "const": true
+        },
+        "silent_cpu_fallback": {
+          "const": "forbidden"
+        }
+      }
+    },
+    "cpu": {
+      "type": "object",
+      "required": [
+        "architecture",
+        "status"
+      ],
+      "properties": {
+        "architecture": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cores": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "enum": [
+            "detected",
+            "unavailable",
+            "unknown",
+            "unsupported",
+            "error"
+          ]
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "mem_total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mem_available_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "enum": [
+            "detected",
+            "unavailable",
+            "unknown",
+            "unsupported",
+            "error"
+          ]
+        }
+      }
+    },
+    "loaded_modules": {
+      "type": "object"
+    }
+  }
+}
