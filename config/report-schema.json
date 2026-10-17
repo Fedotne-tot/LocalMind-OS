@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "localmind-report-0.1.0",
+  "title": "LocalMind OS hardware report v0",
+  "type": "object",
+  "required": [
+    "schema_version", "tool_version", "generated_at_utc", "hostname",
+    "kernel_release", "drm_gpus", "kfd_nodes", "lspci_display",
+    "stacks", "classification", "policy"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {"const": "0.1.0"},
+    "tool_version": {"type": "string"},
+    "generated_at_utc": {"type": "string"},
+    "hostname": {"type": "string"},
+    "os_pretty_name": {"type": ["string", "null"]},
+    "kernel_release": {"type": ["string", "null"]},
+    "drm_gpus": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["card", "vendor_id", "device_id", "vendor"],
+        "properties": {
+          "card": {"type": "string"},
+          "vendor_id": {"type": "string", "pattern": "^0x[0-9a-f]{4}$"},
+          "device_id": {"type": "string", "pattern": "^0x[0-9a-f]{4}$"},
+          "vendor": {"type": "string"},
+          "driver": {"type": ["string", "null"]},
+          "model": {"type": ["string", "null"]},
+          "vram_bytes": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "kfd_nodes": {"type": "array"},
+    "lspci_display": {"type": "array"},
+    "stacks": {
+      "type": "object",
+      "required": ["rocminfo_binary", "vulkaninfo_binary", "vulkan_icd_dirs_present"],
+      "properties": {
+        "rocm_install_dir": {"type": ["string", "null"]},
+        "rocm_version_file": {"type": ["string", "null"]},
+        "rocminfo_binary": {"type": "boolean"},
+        "vulkaninfo_binary": {"type": "boolean"},
+        "vulkan_icd_dirs_present": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "classification": {
+      "type": "object",
+      "required": ["amd_gpu_detected", "kfd_device_present", "preliminary_verdict"],
+      "properties": {
+        "amd_gpu_detected": {"type": "boolean"},
+        "amdgpu_driver_bound": {"type": "boolean"},
+        "kfd_device_present": {"type": "boolean"},
+        "known_gfx_aliases_in_kfd": {"type": "array"},
+        "preliminary_verdict": {
+          "enum": ["ROCM_CANDIDATE", "VULKAN_ONLY_CANDIDATE", "NO_AMD_GPU"]
+        },
+        "note": {"type": "string"}
+      }
+    },
+    "policy": {
+      "type": "object",
+      "required": ["gpu_strict_default", "silent_cpu_fallback"],
+      "properties": {
+        "gpu_strict_default": {"const": true},
+        "silent_cpu_fallback": {"const": "forbidden"}
+      }
+    }
+  }
+}
