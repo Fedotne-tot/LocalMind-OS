@@ -385,7 +385,12 @@ def detect_loaded_modules() -> dict:
     lines = read_lines(os.path.join(sysfs_root(), "proc/modules"))
     if lines is None:
         return {k: STATUS_UNAVAILABLE for k in mods}
-    loaded = {line.split()[0] for line in lines if line.strip()}
+    try:
+        loaded = {line.split()[0] for line in lines if line.strip()}
+    except Exception:
+        # инженерная проверка C1: битая/неожидаланная строка валила весь
+        # отчёт NameError'ом; теперь честный status=error, детектор живёт
+        return {k: STATUS_ERROR for k in mods}
     return {m: (STATUS_DETECTED if m in loaded else STATUS_UNAVAILABLE)
             for m in mods}
 
@@ -442,7 +447,14 @@ def detect_stack_presence() -> dict:
     def tool_status(name: str, args: list[str] | None = None) -> str:
         if not shutil.which(name):
             return STATUS_UNAVAILABLE
-        out = run_cmd(args or [name, "--version"])
+        # инженерная проверка C4 (нестабильность после обновлений): bинарь
+        # мог оказаться в битом окружении (напр. удалённая libstdc++), где
+        # subprocess.run бросает OSError; раньше это валило весь отчёт —
+        # теперь честный status=error
+        try:
+            out = run_cmd(args or [name, "--version"])
+        except Exception:
+            return STATUS_ERROR
         return STATUS_DETECTED if out is not None else STATUS_ERROR
     stacks["rocminfo_binary"] = bool(shutil.which("rocminfo"))
     stacks["vulkaninfo_binary"] = bool(shutil.which("vulkaninfo"))
@@ -483,14 +495,23 @@ def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
     одному разу; лишним AMD-картам — unknown (точное соответствие dev→node
     даёт только probe E3 через /dev/kfd ioctl).
     """
-    gfx_in_nodes = [n.get("name") for n in kfd if n.get("name")]
-    known_gfx = [g for g in gfx_in_nodes if g in GFX_ALIASES]
-    pool = list(known_gfx)  # каждый алиас можно использовать один раз
     amd_cards = [gpu for gpu in gpus if gpu["vendor_id"] == "0x1002"]
+    # Инженерная проверка C2: раньше узлы с ОТСУТСТВИЕМ поля name (битый/
+    # нечитаемый properties, старые ядра без CRAT) молча отбрасывались —
+    # на системе с реальной RX-картой это давало kfd_node_present=False и
+    # ложный compute_status=unsupported. Теперь такие узлы считаются
+    # «KFD есть» (unknown), unsupported остаётся только для доказанных
+    # случаев (не-amdgpu драйвер, whitelist-модель).
+    named_nodes = [n for n in kfd if n.get("status") == STATUS_DETECTED]
+    gfx_in_nodes = [n.get("name") for n in named_nodes if n.get("name")]
+    known_gfx = [g for g in gfx_in_nodes if g in GFX_ALIASES]
+    unknown_gfx_nodes = [n for n in named_nodes if not n.get("name")]
+    pool = list(known_gfx)  # каждый алиас можно использовать один раз
     # если AMD-карт столько же, сколько известных gfx-узлов, порядок cardN
     # обычно совпадает с порядком узлов — но это эвристика v0, поэтому при
     # неоднозначности (разные количества) распределение НЕ выполняем вовсе
     exact = len(pool) == len(amd_cards)
+    has_kfd_device = dev_exists("dev/kfd") or bool(kfd)
     for gpu in amd_cards:
         if gpu.get("device_id") in RDNA1_IGPU_NO_ROCM:
             gpu["kfd_node_present"] = False
@@ -499,17 +520,18 @@ def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
             gpu["kfd_node_present"] = True
             gpu["kfd_gfx"] = gfx
             gpu["architecture"] = GFX_ALIASES[gfx]
-        elif known_gfx:
-            # неоднозначно: KFD есть, но привязать к этой карте нельзя
-            gpu["kfd_node_present"] = dev_exists("dev/kfd")
+        elif known_gfx or unknown_gfx_nodes:
+            # неоднозначно или имя узла неизвестно: KFD есть, привязать нельзя
+            gpu["kfd_node_present"] = True
         else:
-            gpu["kfd_node_present"] = dev_exists("dev/kfd")
+            gpu["kfd_node_present"] = has_kfd_device
 
 
 def classify(gpus: list[dict], kfd: list[dict]) -> dict:
     """Честная первичная классификация. NOT_TESTED ≠ PASS (POLICY P4)."""
     amd_gpu = any(g["vendor_id"] == "0x1002" for g in gpus)
-    kfd_present = dev_exists("dev/kfd")
+    kfd_present = dev_exists("dev/kfd") or bool(kfd)  # C3: узлы topology —
+    # тоже доказательство KFD, даже если /dev/kfd не виден из песочницы/контейнера
     amdgpu_driver = any(g.get("driver") == "amdgpu" for g in gpus)
     gfx = [a for a in GFX_ALIASES if a in json.dumps(kfd)]
     return {

@@ -307,6 +307,86 @@ class TestAuditFixes(unittest.TestCase):
         self.assertIn("Ryzen", rep2["cpu"]["model"])
 
 
+class TestAuditRound2(unittest.TestCase):
+    """Регрессии второй инженерной проверки (C1–C5)."""
+
+    def _fixture(self, base: str) -> str:
+        import shutil, tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fx = os.path.join(tmp, "fx")
+        shutil.copytree(os.path.join(GOLDEN, base), fx, symlinks=True)
+        return fx
+
+    def test_C1_corrupt_proc_modules_is_error_not_crash(self):
+        """Битый /proc/modules не должен валить весь отчёт (было NameError)."""
+        fx = self._fixture("fake-amd-kfd")
+        with open(os.path.join(fx, "proc/modules"), "wb") as fh:
+            fh.write(b"\xff\xfe garbage \x00\n")
+        proc = run_detect(fx)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rep = json.loads(proc.stdout)
+        self.assertNotIn("detected", set(rep["loaded_modules"].values()))
+
+    def test_C2_kfd_node_without_name_never_false_unsupported(self):
+        """KFD-узел без имени (битый properties) != unsupported для RX-карты.
+
+        Сценарий с реальным риском ложного отказа: amdgpu + topology-узлы,
+        но имена нечитаемы → compute_status обязан быть unknown (ждём probe),
+        а не unsupported.
+        """
+        import glob
+        fx = self._fixture("fake-amd-kfd")
+        for p in glob.glob(os.path.join(
+                fx, "sys/devices/virtual/kfd/kfd/topology/nodes/*/properties")):
+            with open(p, "w") as fh:
+                fh.write("corrupted\n")
+        rep = report(fx)
+        amd = next(g for g in rep["drm_gpus"] if g["vendor_id"] == "0x1002")
+        self.assertNotEqual(amd["compute_status"], "unsupported")
+        self.assertTrue(rep["classification"]["kfd_device_present"])
+
+    def test_C3_no_dev_kfd_file_but_topology_nodes_still_detected(self):
+        """Отсутствие /dev/kfd при живых KFD-узлах — не потеря GPU (C3)."""
+        import glob
+        fx = self._fixture("fake-amd-kfd")
+        devkfd = os.path.join(fx, "dev/kfd")
+        if os.path.exists(devkfd):
+            os.remove(devkfd)
+        # узлы без имён: kfd_node_present обязан опознать сам факт KFD
+        for p in glob.glob(os.path.join(
+                fx, "sys/devices/virtual/kfd/kfd/topology/nodes/*/properties")):
+            with open(p, "w") as fh:
+                fh.write("corrupted\n")
+        rep = report(fx)
+        self.assertTrue(rep["classification"]["kfd_device_present"])
+        amd = next(g for g in rep["drm_gpus"] if g["vendor_id"] == "0x1002")
+        self.assertTrue(amd["kfd_node_present"])
+        self.assertEqual(amd["compute_status"], "unknown")
+
+    def test_C4_broken_binary_env_is_error_not_crash(self):
+        """Битый bинарь (OSError при exec) → tool_status=error, отчёт живой."""
+        orig_run_cmd = lmd.run_cmd
+        try:
+            def boom(argv):
+                raise OSError("libstdc++.so.6: cannot open shared object")
+            lmd.run_cmd = boom
+            stacks = lmd.detect_stack_presence()
+            # статусы обязаны остаться в допустимом множестве (никакого падения)
+            for name in ("lspci", "rocminfo", "vulkaninfo"):
+                self.assertIn(stacks["tool_status"][name], ALL_STATUSES)
+        finally:
+            lmd.run_cmd = orig_run_cmd
+
+    def test_C5_schema_requires_os_pretty_name(self):
+        """Поле всегда присутствует в отчёте — схема обязывает его (C5)."""
+        import json as _json
+        schema = _json.load(open(os.path.join(REPO, "config", "report-schema.json")))
+        self.assertIn("os_pretty_name", schema["required"])
+        rep = report(None)
+        self.assertIn("os_pretty_name", rep)
+
+
 
 if __name__ == "__main__":
     unittest.main()
