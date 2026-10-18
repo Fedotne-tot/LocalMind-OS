@@ -19,6 +19,7 @@
   ./localmind-detect              # человекочитаемый вывод
   ./localmind-detect --json       # JSON-отчёт
   ./localmind-detect --doctor     # первичная диагностика GPU (exit 0/1)
+  ./localmind-detect lm-doctor    # E7: каркас lm doctor (exit 0 OK / 1 INCOMPLETE|ERROR / 2 NEEDS_PROBE)
   LM_FAKE_SYS=/path/to/fake ./localmind-detect --json   # фикстуры (тесты)
 """
 
@@ -637,6 +638,29 @@ def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
             )
 
 
+def summarize_kfd_correlation(gpus: list[dict]) -> str:
+    """Один токен сводки KFD-корреляции по всем AMD-картам (для doctor/E7).
+
+    Детальные причины — в per-GPU поле kfd_correlation; здесь только агрегат,
+    чтобы consumer-ы (lm doctor) не пересчитывали корреляцию заново.
+    Приоритет: любая ошибка сбора > неоднозначность/несовпадение чисел >
+    unreadable > вне-whitelist > нет KFD > matched > not_evaluated.
+    """
+    reasons = [g.get("kfd_correlation", KFD_CORR_NOT_EVALUATED)
+               for g in gpus if g["vendor_id"] == "0x1002"]
+    if not reasons:
+        return KFD_CORR_NOT_EVALUATED
+    for r in reasons:
+        if r == STATUS_ERROR:
+            return STATUS_ERROR
+    for bucket in (KFD_CORR_AMBIGUOUS, KFD_CORR_COUNT_MISMATCH,
+                   KFD_CORR_UNREADABLE, KFD_CORR_NOT_IN_WHITELIST,
+                   KFD_CORR_NOT_PRESENT, KFD_CORR_MATCHED):
+        if bucket in reasons:
+            return bucket
+    return KFD_CORR_NOT_EVALUATED
+
+
 def classify(gpus: list[dict], kfd: list[dict]) -> dict:
     """Честная первичная классификация. NOT_TESTED ≠ PASS (POLICY P4)."""
     amd_gpu = any(g["vendor_id"] == "0x1002" for g in gpus)
@@ -648,6 +672,10 @@ def classify(gpus: list[dict], kfd: list[dict]) -> dict:
         "amd_gpu_detected": amd_gpu,
         "amdgpu_driver_bound": amdgpu_driver,
         "kfd_device_present": kfd_present,
+        # E7 (каркас lm doctor): diagnostic-only сводка per-GPU
+        # kfd_correlation; обратная совместимость — новое необязательное
+        # поле, старые отчёты читаются как «not_evaluated»
+        "kfd_correlation_summary": summarize_kfd_correlation(gpus),
         "known_gfx_aliases_in_kfd": gfx,
         "preliminary_verdict": (
             "ROCM_CANDIDATE" if (amd_gpu and kfd_present and amdgpu_driver)
@@ -773,6 +801,152 @@ def gpu_diagnosis(report: dict) -> list[str]:
     return d
 
 
+# --------------------------------------------------------------------------
+# E7: каркас lm doctor — систематизированный health-check поверх отчёта.
+# Только рендер уже собранного JSON-отчёта build_report(): никакой
+# повторной/дублирующей проверки системы, ничего не устанавливает.
+# Честность (POLICY P4): секции помечены [факт] (подтверждено read-only
+# данными) или [?]/[нет] (unknown/unavailable); присутствие ROCm/Vulkan —
+# ФАКТ окружения, а НЕ вывод о работе вычислительной среды; статус OK
+# выдаётся ТОЛЬКО когда все обязательные факты подтверждены И корреляция
+# matched; иначе INCOMPLETE/NEEDS_PROBE.
+# --------------------------------------------------------------------------
+
+DOCTOR_SUMMARY_TOKENS = {
+    KFD_CORR_MATCHED: "OK",
+    KFD_CORR_AMBIGUOUS: "AMBIGUOUS",
+    KFD_CORR_COUNT_MISMATCH: "COUNT-MISMATCH",
+    KFD_CORR_UNREADABLE: "UNREADABLE",
+    KFD_CORR_NOT_IN_WHITELIST: "OFFLIST-GFX",
+    KFD_CORR_NOT_PRESENT: "NO-KFD",
+    KFD_CORR_UNSUPPORTED_MODEL: "UNSUPPORTED-MODEL",
+    KFD_CORR_UNSUPPORTED_DRIVER: "DRIVER-NOT-AMDGPU",
+    KFD_CORR_NOT_EVALUATED: "NOT-EVALUATED",
+}
+
+
+def _fmt_gib(nbytes) -> str | None:
+    if not isinstance(nbytes, int) or nbytes <= 0:
+        return None
+    return f"{nbytes // (1024 ** 3)} GiB"
+
+
+def doctor_sections(report: dict) -> list[tuple[str, list[str]]]:
+    """Разворачивает отчёт в секции doctor'а; возвращает [(имя, строки)]."""
+    s = []
+    cpu = report["cpu"]
+    ok = cpu["status"] == STATUS_DETECTED and cpu["model"]
+    s.append(("CPU", [
+        f"[{'факт' if ok else '?'}] {cpu['model'] or 'модель неизвестна'}"
+        f" (arch={cpu['architecture']}, cores={cpu['cores'] or '?'},"
+        f" status={cpu['status']})"]))
+    mem = report["memory"]
+    total = _fmt_gib(mem["mem_total_bytes"])
+    avail = _fmt_gib(mem["mem_available_bytes"])
+    ok = mem["status"] == STATUS_DETECTED and total
+    s.append(("RAM", [
+        f"[{'факт' if ok else '?'}] total={total or 'неизвестно'},"
+        f" available={avail or 'неизвестно'} (status={mem['status']})"]))
+    gpus = report["drm_gpus"]
+    lines = []
+    if not gpus:
+        lines.append("[нет] DRM-устройств не обнаружено (unavailable)")
+    for g in gpus:
+        model = g.get("model") or "неизвестна"
+        lines.append(
+            f"[{g['model_status']}] GPU {g['card']}: {g['vendor']} "
+            f"[{g['vendor_id']}:{g['device_id']}] модель={model}")
+        drv = g.get("driver")
+        lines.append(f"[{g['driver_status']}] драйвер: {drv or 'не привязан'}")
+        vr = _fmt_gib(g.get("vram_bytes"))
+        if g["vram_status"] == STATUS_DETECTED and vr:
+            lines.append(f"[факт] VRAM: {vr}")
+        else:
+            lines.append(f"[?] VRAM: {g['vram_status']}")
+        cs = g["compute_status"]
+        reason = g.get("kfd_correlation", KFD_CORR_NOT_EVALUATED)
+        if cs == STATUS_DETECTED:
+            lines.append(
+                f"[факт] compute: кандидат ROCm (gfx={g.get('kfd_gfx')},"
+                f" архитектура {g.get('architecture')}); поддержка НЕ проверена")
+        elif cs == STATUS_UNSUPPORTED:
+            lines.append(f"[нет] compute: unsupported ({reason})")
+        else:
+            lines.append(f"[?] compute: unknown, причина: {reason}")
+    s.append(("GPU", lines))
+    mods = report["loaded_modules"]
+    s.append(("Драйвер (модули)", [
+        ", ".join(f"{m}={st}" for m, st in sorted(mods.items())),
+        "[нет] наличие модуля ≠ работающая вычислительная среда"]))
+    st = report["stacks"]
+    tools = st["tool_status"]
+    rocm_bits = [
+        f"rocminfo={tools['rocminfo']}",
+        f"/opt/rocm={'да' if st['rocm_install_dir'] else 'нет'}",
+        f"librocmsmi={tools['rocm_smi_lib']}",
+    ]
+    vulk_bits = [
+        f"vulkaninfo={tools['vulkaninfo']}",
+        f"ICD-каталоги: {', '.join(st['vulkan_icd_dirs_present']) or 'нет'}",
+        f"RADV ICD={'да' if st['radv_icd_files'] else 'нет'}",
+    ]
+    s.append(("ROCm (присутствие)", rocm_bits + [
+        "[нет] присутствие инструмента ≠ поддержка данной модели GPU"]))
+    s.append(("Vulkan (присутствие)", vulk_bits + [
+        "[нет] присутствие ICD ≠ работоспособность; probe — E4"]))
+    c = report["classification"]
+    summary = c.get("kfd_correlation_summary", KFD_CORR_NOT_EVALUATED)
+    klines = [f"сводка: {DOCTOR_SUMMARY_TOKENS.get(summary, summary)}"]
+    for g in gpus:
+        if g["vendor_id"] != "0x1002":
+            continue
+        klines.append(
+            f"{g['card']}: {g.get('kfd_correlation', KFD_CORR_NOT_EVALUATED)}"
+            f" node={'+' if g.get('kfd_node_present') else '-'}"
+            f" gfx={g.get('kfd_gfx') or '-'}")
+    klines.append("/dev/kfd или узлы topology: "
+                  + ("есть" if c["kfd_device_present"] else "нет"))
+    s.append(("KFD-корреляция", klines))
+    return s
+
+
+def doctor(report: dict) -> tuple[int, str]:
+    """Каркас lm doctor: рендер секций + честный итог. Возвращает (exit, текст).
+
+    exit 0 — «OK»: все факты подтверждены и корреляция matched (это всё ещё
+    НЕ PASS по поддержке ROCm — финальный вердикт только за probe E3/E4);
+    exit 1 — «INCOMPLETE»: есть unknown/unavailable/неоднозначность;
+    exit 2 — «NEEDS_PROBE»: AMD-GPU без доказанной поддержки (unknown/offlist),
+             требуется machine-прогон (P4/P5).
+    """
+    sections = doctor_sections(report)
+    out = [f"lm doctor v{report['tool_version']} "
+           f"(schema {report['schema_version']}, read-only)"]
+    for name, lines in sections:
+        out.append(f"== {name} ==")
+        out.extend(lines)
+    c = report["classification"]
+    amd = [g for g in report["drm_gpus"] if g["vendor_id"] == "0x1002"]
+    summary = c.get("kfd_correlation_summary", KFD_CORR_NOT_EVALUATED)
+    all_detected = bool(amd) and all(
+        g["compute_status"] == STATUS_DETECTED for g in amd) and summary == \
+        KFD_CORR_MATCHED
+    has_error = any(g["compute_status"] == STATUS_ERROR for g in amd) \
+        or any(st == STATUS_ERROR for st in report["loaded_modules"].values())
+    if all_detected:
+        verdict, code = "OK", 0
+    elif has_error:
+        verdict, code = "ERROR", 1
+    elif amd and summary in (KFD_CORR_NOT_IN_WHITELIST, KFD_CORR_UNSUPPORTED_MODEL,
+                             KFD_CORR_UNSUPPORTED_DRIVER):
+        verdict, code = "NEEDS_PROBE", 2
+    else:
+        verdict, code = "INCOMPLETE", 1
+    out.append(f"ИТОГ: {verdict}")
+    out.append(c["note"])
+    return code, "\n".join(out)
+
+
 def human(report: dict) -> str:
     lines = [
         f"LocalMind detect v{report['tool_version']} (schema {report['schema_version']})",
@@ -807,6 +981,11 @@ def main(argv: list[str]) -> int:
         # первичная диагностика GPU; exit 0 — отчёт собран, 1 — ошибка сбора
         print("\n".join(gpu_diagnosis(report)))
         return 0
+    if "lm-doctor" in argv or "--lm-doctor" in argv:
+        # E7: каркас lm doctor; exit 0 OK / 1 INCOMPLETE|ERROR / 2 NEEDS_PROBE
+        code, text = doctor(report)
+        print(text)
+        return code
     if "--json" in argv:
         json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")

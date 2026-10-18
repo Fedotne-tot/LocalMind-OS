@@ -271,6 +271,21 @@
         "kfd_device_present": {
           "type": "boolean"
         },
+        "kfd_correlation_summary": {
+          "description": "E7 (lm doctor): агрегат per-GPU kfd_correlation; diagnostic-only, необязателен (старые отчёты = not_evaluated)",
+          "enum": [
+            "matched",
+            "kfd_not_present",
+            "node_properties_unreadable",
+            "ambiguous_mapping",
+            "count_mismatch",
+            "gfx_not_in_whitelist",
+            "driver_not_amdgpu",
+            "model_not_rocm_supported",
+            "not_evaluated",
+            "error"
+          ]
+        },
         "known_gfx_aliases_in_kfd": {
           "type": "array"
         },

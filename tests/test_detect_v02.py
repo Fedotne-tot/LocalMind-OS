@@ -22,6 +22,7 @@
 import json
 import os
 import shutil
+import tempfile
 import subprocess
 import sys
 import unittest
@@ -825,6 +826,136 @@ class TestKfdCorrelationCases(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("VRAM: 16368 MiB (detected)", proc.stdout)
         self.assertIn("unknown", proc.stdout)
+
+
+class TestLmDoctorSkeleton(unittest.TestCase):
+    """E7: каркас lm doctor — health-check поверх build_report().
+
+    Честность (POLICY P4):
+      * OK/exit 0 — только при доказанной корреляции matched; это НЕ PASS
+        по поддержке ROCm (финальный вердикт — probe E3/E4);
+      * unknown/unavailable помечаются [?]/[нет], факты — [факт];
+      * присутствие ROCm/Vulkan никогда не подаётся как «среда работает»;
+      * lm doctor ничего заново не собирает — только рендер отчёта.
+    """
+
+    FIXTURE = os.path.join(GOLDEN, "fake-rdna3-7800xt")
+    NODES = "sys/devices/virtual/kfd/kfd/topology/nodes"
+
+    def _fixture_without_igpu_node(self) -> str:
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fx = os.path.join(tmp, "fx")
+        shutil.copytree(self.FIXTURE, fx, symlinks=True)
+        shutil.rmtree(os.path.join(fx, self.NODES, "2"))
+        return fx
+
+    # --- CLI ---------------------------------------------------------------
+    def test_cli_sections_cover_required_topics(self):
+        proc = run_detect(self.FIXTURE, ["lm-doctor"])
+        self.assertEqual(proc.returncode, 1)  # count_mismatch → INCOMPLETE
+        for header in ("== CPU ==", "== RAM ==", "== GPU ==",
+                       "== Драйвер (модули) ==", "== ROCm (присутствие) ==",
+                       "== Vulkan (присутствие) ==", "== KFD-корреляция =="):
+            self.assertIn(header, proc.stdout)
+        self.assertIn("ИТОГ: INCOMPLETE", proc.stdout)
+
+    def test_cli_matched_exit_zero_is_not_pass(self):
+        fx = self._fixture_without_igpu_node()
+        proc = run_detect(fx, ["lm-doctor"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ИТОГ: OK", proc.stdout)
+        self.assertIn("gfx=gfx1101", proc.stdout)
+        # OK ≠ PASS: disclaimer о probe обязан присутствовать; слово PASS
+        # допустимо ТОЛЬКО в disclaimer-строке (как в test_doctor_reports_reason)
+        self.assertIn("выдаёт только probe", proc.stdout)
+        for line in proc.stdout.splitlines():
+            if "PASS" in line:
+                self.assertIn("выдаёт только probe", line)
+
+    def test_cli_offlist_gfx_needs_probe_exit_two(self):
+        fx = self._fixture_without_igpu_node()
+        with open(os.path.join(fx, self.NODES, "1/properties"), "w") as fh:
+            fh.write("name gfx950\nunique_id 1\nsimd_count 192\n")
+        proc = run_detect(fx, ["lm-doctor"])
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("ИТОГ: NEEDS_PROBE", proc.stdout)
+        self.assertIn("OFFLIST-GFX", proc.stdout)
+
+    # --- честность разделения фактов и неизвестного -----------------------
+    def test_facts_and_unknowns_are_distinguished(self):
+        rep = report(self.FIXTURE)
+        text = "\n".join(l for _, ls in lmd.doctor_sections(rep) for l in ls)
+        self.assertIn("[факт] VRAM: 15 GiB", text)          # подтверждённый факт
+        self.assertIn("[?] compute: unknown, причина: count_mismatch", text)
+        self.assertIn("[unknown] GPU card0", text)          # модель без subsystem-доказательства
+        self.assertIn("модель=AMD Radeon Graphics", text)   # обобщённый label, не выдуманное имя
+
+    def test_tool_presence_never_claimed_as_working_env(self):
+        # даже если rocminfo/vulkaninfo «detected» — doctor говорит лишь о
+        # присутствии и явно отрицает работоспособность среды
+        rep = report(self.FIXTURE)
+        rep["stacks"]["tool_status"]["rocminfo"] = "detected"
+        rep["stacks"]["tool_status"]["vulkaninfo"] = "detected"
+        text = "\n".join(l for _, ls in lmd.doctor_sections(rep) for l in ls)
+        self.assertIn("присутствие инструмента ≠ поддержка данной модели GPU", text)
+        self.assertIn("присутствие ICD ≠ работоспособность", text)
+
+    def test_no_gpu_honest_incomplete(self):
+        proc = run_detect(os.path.join(GOLDEN, "fake-no-gpu"), ["lm-doctor"])
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("[нет] DRM-устройств не обнаружено", proc.stdout)
+        self.assertIn("ИТОГ: INCOMPLETE", proc.stdout)
+        self.assertNotIn("ИТОГ: OK", proc.stdout)
+
+    # --- сводка корреляции и совместимость со схемой ----------------------
+    def test_summary_matches_per_gpu_reasons(self):
+        cases = {
+            "fake-amd-kfd": "matched",
+            "fake-rdna2-vega": "matched",
+            "fake-rdna3-7800xt": "count_mismatch",
+            "fake-multi-gpu": "kfd_not_present",
+        }
+        for fx, expected in cases.items():
+            rep = report(os.path.join(GOLDEN, fx))
+            self.assertEqual(
+                rep["classification"]["kfd_correlation_summary"], expected, fx)
+
+    def test_summary_absent_in_old_reports_reads_not_evaluated(self):
+        # обратная совместимость: старый отчёт без поля — doctor не падает
+        rep = report(self.FIXTURE)
+        del rep["classification"]["kfd_correlation_summary"]
+        code, text = lmd.doctor(rep)
+        self.assertEqual(code, 1)  # unknown из per-GPU причин, не выдуманный OK
+        self.assertIn("NOT-EVALUATED", text)
+
+    def test_reports_validate_against_schema_with_new_field(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema недоступен в среде тестов")
+        schema = json.load(open(os.path.join(REPO, "config", "report-schema.json")))
+        for fx in ("fake-amd-kfd", "fake-rdna2-vega", "fake-rdna3-7800xt",
+                   "fake-multi-gpu"):
+            rep = report(os.path.join(GOLDEN, fx))
+            # штатное расхождение vram_bytes:null вне рамок этой задачи —
+            # поле необязательное, убираем null перед валидацией
+            for g in rep["drm_gpus"]:
+                if g.get("vram_bytes") is None:
+                    del g["vram_bytes"]
+            jsonschema.validate(rep, schema)
+
+    def test_doctor_does_not_recollect_data(self):
+        # doctor принимает готовый отчёт; сбор вызывает только build_report
+        rep = report(self.FIXTURE)
+        calls = []
+        orig = lmd.build_report
+        lmd.build_report = lambda: calls.append(1) or orig()
+        try:
+            lmd.doctor(rep)          # ни одного повторного сбора
+        finally:
+            lmd.build_report = orig
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
