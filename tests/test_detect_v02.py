@@ -445,6 +445,55 @@ class TestAuditRound3(unittest.TestCase):
             self.assertNotIn("supported\": true", blob)
 
 
+class TestRdna2WithCpuNode(unittest.TestCase):
+    """Фикстура fake-rdna2-vega: RDNA2 (gfx1030) + CPU-узел KFD без поля name.
+
+    Сценарий реального Linux: topology содержит узел 0 (CPU, properties без
+    «name») и узел 1 (GPU gfx1030). Проверяет, что:
+      * CPU-узел НЕ порождает ложный gfx-алиас в классификации;
+      * GPU-узел корректно коррелирует с DRM-картой (known_gfx из KFD);
+      * VRAM 16 GiB детектируется по mem_info_vram_total.
+    """
+
+    def setUp(self):
+        self.report_ = report(os.path.join(GOLDEN, "fake-rdna2-vega"))
+
+    def test_cpu_node_has_no_name_and_not_attributed(self):
+        # в JSON-отчёте ключи словарей всегда строковые
+        nodes = {str(n["node"]): n for n in self.report_["kfd_nodes"]}
+        self.assertIn("0", nodes)
+        self.assertNotIn("name", nodes["0"])
+        # CPU-узел не должен «получать» gfx от куда-то
+        c = self.report_["classification"]
+        self.assertEqual(c["known_gfx_aliases_in_kfd"], ["gfx1030"])
+
+    def test_gpu_card_correlated_with_gfx1030(self):
+        gpus = self.report_["drm_gpus"]
+        self.assertEqual(len(gpus), 1)
+        g = gpus[0]
+        self.assertEqual(g["vendor_id"], "0x1002")
+        self.assertEqual(g["device_id"], "0x73bf")
+        self.assertEqual(g["driver"], "amdgpu")
+        self.assertEqual(g["kfd_gfx"], "gfx1030")
+        self.assertEqual(g["architecture"], "RDNA2")
+        self.assertEqual(g["compute_status"], "detected")
+        self.assertEqual(g["vram_bytes"], 16 * 1024 ** 3)
+        self.assertEqual(g["vram_status"], "detected")
+
+    def test_verdict_is_candidate_not_pass(self):
+        c = self.report_["classification"]
+        self.assertEqual(c["preliminary_verdict"], "ROCM_CANDIDATE")
+        self.assertTrue(c["amdgpu_driver_bound"])
+        # POLICY P4: нигде нет PASS/«поддерживается»
+        blob = json.dumps(self.report_)
+        self.assertNotIn('"PASS"', blob)
+
+    def test_all_statuses_valid_enum(self):
+        for g in self.report_["drm_gpus"]:
+            for key in ("driver_status", "vram_status", "model_status",
+                        "compute_status"):
+                self.assertIn(g[key], ALL_STATUSES)
+
 
 if __name__ == "__main__":
     unittest.main()
