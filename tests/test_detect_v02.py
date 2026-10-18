@@ -21,6 +21,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -570,6 +571,9 @@ class TestRdna3Target7800XT(unittest.TestCase):
         self.assertTrue(g["kfd_node_present"])              # C2: KFD всё же есть
         self.assertEqual(g["compute_status"], "unknown")    # ждёт probe E3/E4
         self.assertNotEqual(g["compute_status"], "unsupported")
+        # E1: unknown обязан быть РАЗЪЯСНЁН: 2 известных gfx-узла vs 1 карта
+        # — количества не сходятся, привязка была бы догадкой
+        self.assertEqual(g["kfd_correlation"], "count_mismatch")
 
     def test_verdict_candidate_but_no_pass(self):
         c = self.rep["classification"]
@@ -621,8 +625,200 @@ class TestRdna3Target7800XT(unittest.TestCase):
         self.assertEqual(g["kfd_gfx"], "gfx1101")
         self.assertEqual(g["architecture"], "RDNA3")
         self.assertEqual(g["compute_status"], "detected")  # кандидат ROCm
+        # E1: detected обязан быть РАЗЪЯСНЁН как подтверждённая привязка
+        self.assertEqual(g["kfd_correlation"], "matched")
         blob = json.dumps(rep)
         self.assertNotIn('"PASS"', blob)                   # detected != PASS
+
+
+ALL_CORRELATION_REASONS = {
+    "matched", "driver_not_amdgpu", "model_not_rocm_supported",
+    "kfd_not_present", "node_properties_unreadable", "ambiguous_mapping",
+    "count_mismatch", "gfx_not_in_whitelist", "not_evaluated",
+}
+
+
+class TestKfdCorrelationCases(unittest.TestCase):
+    """E1: отчёт честно различает три ситуации вокруг неоднозначной KFD-связи.
+
+    Ситуация 1 — KFD корректно сопоставлен с GPU → compute_status=detected,
+                 kfd_correlation=matched;
+    Ситуация 2 — KFD существует, но gfx вне whitelist (например будущая
+                 архитектура) → unknown + gfx_not_in_whitelist (НЕ unsupported:
+                 данных о неподдержке нет);
+    Ситуация 3 — KFD и GPU есть, но связь невозможно однозначно установить →
+                 unknown + count_mismatch / ambiguous_mapping /
+                 node_properties_unreadable.
+
+    Политика доказательств (P4/P5) не изменена: ни один unknown не подменён
+    догадкой, PASS не выдаётся без machine-отчёта с реального железа.
+    """
+
+    FIXTURE = os.path.join(GOLDEN, "fake-rdna3-7800xt")
+
+    def _fixture(self) -> str:
+        import shutil, tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fx = os.path.join(tmp, "fx")
+        shutil.copytree(self.FIXTURE, fx, symlinks=True)
+        return fx
+
+    NODES = "sys/devices/virtual/kfd/kfd/topology/nodes"
+
+    # --- ситуация 1: корректная корреляция --------------------------------
+    def test_case1_matched_correlation(self):
+        """Один gfx-узел + одна amdgpu-карта: привязка доказуема → matched."""
+        fx = self._fixture()
+        shutil.rmtree(os.path.join(fx, self.NODES, "2"))  # убрать iGPU-узел
+        rep = report(fx)
+        g = rep["drm_gpus"][0]
+        self.assertEqual(g["kfd_gfx"], "gfx1101")
+        self.assertEqual(g["architecture"], "RDNA3")
+        self.assertEqual(g["compute_status"], "detected")
+        self.assertEqual(g["kfd_correlation"], "matched")
+        self.assertTrue(g["kfd_node_present"])
+        # detected — это всё ещё НЕ PASS (P4): финальный вердикт за probe
+        self.assertNotIn('"PASS"', json.dumps(rep))
+
+    # --- ситуация 2: KFD есть, gfx вне whitelist --------------------------
+    def test_case2_kfd_present_gfx_not_in_whitelist(self):
+        """gfx950 (нет в GFX_ALIASES) при одной карте: unknown, не unsupported."""
+        self.assertNotIn("gfx950", lmd.GFX_ALIASES)
+        fx = self._fixture()
+        # единственный GPU-узел KFD с неизвестным алиасом: узел 1 (тот, что
+        # коррелирует с дискретной картой) переписываем на gfx950; iGPU-узел 2
+        # убираем, иначе два именованных gfx-узла vs одна карта — это уже
+        # ситуация 3 (count_mismatch), а не «вне whitelist»
+        shutil.rmtree(os.path.join(fx, self.NODES, "2"))
+        props = os.path.join(fx, self.NODES, "1/properties")
+        with open(props, "w") as fh:
+            fh.write("name gfx950\nunique_id 1\nsimd_count 192\n"
+                     "mem_banks_count 2\nio_links_count 1\n")
+        rep = report(fx)
+        g = rep["drm_gpus"][0]
+        self.assertNotIn("kfd_gfx", g)                    # чужой алиас не приписан
+        self.assertTrue(g["kfd_node_present"])            # KFD действительно есть
+        self.assertEqual(g["compute_status"], "unknown")  # НЕ unsupported (нет данных)
+        self.assertEqual(g["kfd_correlation"], "gfx_not_in_whitelist")
+        # классификация тоже не находит известных алиасов — никаких выдумок
+        self.assertEqual(rep["classification"]["known_gfx_aliases_in_kfd"], [])
+
+    def test_case2_offlist_alias_never_becomes_architecture(self):
+        """Вне-whitelist gfx не должен порождать поле architecture (без догадок)."""
+        fx = self._fixture()
+        # известные узлы убираем: иначе pool из gfx1036 дал бы matched;
+        # CPU-узел 0 остаётся без name (нативное свойство CPU-узлов KFD)
+        shutil.rmtree(os.path.join(fx, self.NODES, "2"))
+        p = os.path.join(fx, self.NODES, "1/properties")
+        with open(p, "w") as fh:
+            fh.write("name gfx9999\nunique_id 1\nsimd_count 64\n")
+        rep = report(fx)
+        g = rep["drm_gpus"][0]
+        self.assertNotIn("kfd_gfx", g)
+        self.assertNotEqual(g.get("architecture"), "RDNA2")  # ложная архитектура
+        self.assertEqual(g["compute_status"], "unknown")
+        self.assertEqual(g["kfd_correlation"], "gfx_not_in_whitelist")
+
+    # --- ситуация 3: связь невозможно однозначно установить ---------------
+    def test_case3a_count_mismatch_two_nodes_one_card(self):
+        """Базовая фикстура: 2 известных gfx-узла vs 1 DRM-карта → count_mismatch."""
+        rep = report(self.FIXTURE)
+        g = rep["drm_gpus"][0]
+        self.assertTrue(g["kfd_node_present"])
+        self.assertNotIn("kfd_gfx", g)                    # не угадываем, какой узел чей
+        self.assertEqual(g["compute_status"], "unknown")
+        self.assertEqual(g["kfd_correlation"], "count_mismatch")
+
+    def test_case3b_ambiguous_mapping_two_cards_two_nodes(self):
+        """2 карты и 2 gfx-узла: порядок cardN↔node N не доказан → ambiguous."""
+        fx = self._fixture()
+        # вторая AMD-карта: карточка в /sys/class/drm с device→PCI-узлом
+        # 0000:03:00.0 (уже есть в фикстуре); заполняем PCI-узел как udev
+        dev = os.path.join(fx, "sys/devices/pci0000:00/0000:03:00.0")
+        for fname, val in (("vendor", "0x1002\n"), ("device", "0x7480\n"),
+                           ("mem_info_vram_total", "17163096064\n")):
+            with open(os.path.join(dev, fname), "w") as fh:
+                fh.write(val)
+        drv = os.path.join(dev, "driver")
+        if not os.path.lexists(drv):
+            os.symlink("../../bus/pci/drivers/amdgpu", drv)
+        card1 = os.path.join(fx, "sys/class/drm/card1")
+        os.makedirs(card1, exist_ok=True)
+        link = os.path.join(card1, "device")
+        if os.path.lexists(link):
+            os.remove(link)
+        # relative symlink разрешается относительно каталога ссылки:
+        # sys/class/drm/card1 -> ../../../devices/... = sys/devices/...
+        os.symlink("../../../devices/pci0000:00/0000:03:00.0", link)
+        # KFD: два известных gfx-узла (1: gfx1101 уже есть; 2: делаем gfx1030)
+        p2 = os.path.join(fx, self.NODES, "2/properties")
+        with open(p2, "w") as fh:
+            fh.write("name gfx1030\nunique_id 2\nsimd_count 96\n"
+                     "mem_banks_count 1\nio_links_count 1\n")
+        rep = report(fx)
+        amd = [g for g in rep["drm_gpus"] if g["vendor_id"] == "0x1002"]
+        self.assertEqual(len(amd), 2)
+        for g in amd:
+            self.assertNotIn("kfd_gfx", g)                # B3: перекрёстных догадок нет
+            self.assertTrue(g["kfd_node_present"])
+            self.assertEqual(g["compute_status"], "unknown")
+            self.assertEqual(g["kfd_correlation"], "ambiguous_mapping")
+
+    def test_case3c_unreadable_node_names(self):
+        """Все properties биты: KFD есть, имена недоступны → unreadable (C2/E1)."""
+        import glob
+        fx = self._fixture()
+        for p in glob.glob(os.path.join(fx, self.NODES, "*/properties")):
+            with open(p, "w") as fh:
+                fh.write("corrupted\n")
+        rep = report(fx)
+        g = rep["drm_gpus"][0]
+        self.assertTrue(g["kfd_node_present"])            # C2: KFD не потеряли
+        self.assertNotEqual(g["compute_status"], "unsupported")
+        self.assertEqual(g["compute_status"], "unknown")
+        self.assertEqual(g["kfd_correlation"], "node_properties_unreadable")
+
+    # --- инварианты ---------------------------------------------------------
+    def test_reason_always_explains_compute_status(self):
+        """Причина обязана согласованно сопровождать статус (все 3 случая)."""
+        cases = []
+        # 1) matched
+        fx = self._fixture()
+        shutil.rmtree(os.path.join(fx, self.NODES, "2"))
+        cases.append(report(fx))
+        # 2) offlist
+        fx = self._fixture()
+        p = os.path.join(fx, self.NODES, "1/properties")
+        with open(p, "w") as fh:
+            fh.write("name gfx950\nunique_id 1\n")
+        cases.append(report(fx))
+        # 3) базовая фикстура (count_mismatch)
+        cases.append(report(self.FIXTURE))
+        for rep in cases:
+            for g in rep["drm_gpus"]:
+                r = g["kfd_correlation"]
+                self.assertIn(r, ALL_CORRELATION_REASONS)
+                cs = g["compute_status"]
+                if r == "matched":
+                    self.assertEqual(cs, "detected")
+                elif r in ("count_mismatch", "ambiguous_mapping",
+                           "gfx_not_in_whitelist", "node_properties_unreadable"):
+                    self.assertEqual(cs, "unknown")      # никогда не PASS/detected
+                self.assertNotIn('"PASS"', json.dumps(rep))
+
+    def test_doctor_reports_reason_for_unknown(self):
+        """--doctor на целевой фикстуре: unknown сопровождается причиной."""
+        proc = run_detect(self.FIXTURE, ["--doctor"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("причина: count_mismatch", proc.stdout)
+        # P4: PASS может упоминаться ТОЛЬКО в disclaimer-строке про probe;
+        # ни одна секция не должна выглядеть как присвоение PASS
+        for line in proc.stdout.splitlines():
+            if "PASS" in line:
+                self.assertIn("выдаёт только probe", line)
+            self.assertNotIn("Compute: PASS", line)
+            self.assertNotIn("verdict: PASS", line)
 
     def test_doctor_mode_on_target_fixture(self):
         proc = run_detect(self.FIXTURE, ["--doctor"])

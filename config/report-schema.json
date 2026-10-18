@@ -147,6 +147,20 @@
           },
           "kfd_node_present": {
             "type": "boolean"
+          },
+          "kfd_correlation": {
+            "type": "string",
+            "enum": [
+              "matched",
+              "driver_not_amdgpu",
+              "model_not_rocm_supported",
+              "kfd_not_present",
+              "node_properties_unreadable",
+              "ambiguous_mapping",
+              "count_mismatch",
+              "gfx_not_in_whitelist",
+              "not_evaluated"
+            ]
           }
         }
       }

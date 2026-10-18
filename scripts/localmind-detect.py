@@ -41,6 +41,21 @@ STATUS_UNKNOWN = "unknown"            # есть, но данные неполн
 STATUS_UNSUPPORTED = "unsupported"    # инструмент/функция не поддерживается
 STATUS_ERROR = "error"                # попытка сбора завершилась ошибкой
 
+# Причины compute_status (E1: детектор честно РАЗЛИЧАЕТ, ПОЧЕМУ вывод
+# невозможно выдать; статусы POLICY P4 НЕ меняются — unknown остаётся
+# unknown, никакого PASS без machine-отчёта с реального железа).
+# Поле kfd_correlation — diagnostic-only: у старых отчётов его может не быть,
+# отсутствующее поле читается как "not_evaluated" (обратная совместимость).
+KFD_CORR_MATCHED = "matched"                  # gfx-узел привязан к карте (detected)
+KFD_CORR_UNSUPPORTED_DRIVER = "driver_not_amdgpu"  # unsupported: драйвер не amdgpu
+KFD_CORR_UNSUPPORTED_MODEL = "model_not_rocm_supported"  # unsupported: iGPU RDNA1
+KFD_CORR_NOT_PRESENT = "kfd_not_present"      # unknown: узлов KFD нет и /dev/kfd нет
+KFD_CORR_UNREADABLE = "node_properties_unreadable"  # unknown: KFD есть, имена недоступны
+KFD_CORR_AMBIGUOUS = "ambiguous_mapping"      # unknown: карт и gfx-узлов >1, порядок не доказан
+KFD_CORR_COUNT_MISMATCH = "count_mismatch"    # unknown: количество карт и gfx-узлов не сходится
+KFD_CORR_NOT_IN_WHITELIST = "gfx_not_in_whitelist"  # unknown: gfx вне whitelist ROCm
+KFD_CORR_NOT_EVALUATED = "not_evaluated"      # не AMD / корреляция не проводилась
+
 # PCI vendor IDs (публичные данные PCI SIG / upstream hwdata pci.ids)
 VENDOR_IDS = {
     "0x1002": "AMD/ATI",
@@ -293,17 +308,25 @@ def _gpu_compute_status(g: dict) -> str:
                  ИЛИ заведомо неподдерживаемый ROCm iGPU (RDNA1 gfx103x без KFD);
     unknown    — всё остальное: данных достаточно для кандидата, но
                  недостаточно для вывода (требует probe E3/E4).
+    E1: исход записывается в diagnostic-поле kfd_correlation (причина),
+        сами статусы P4 не меняются.
     """
     if g["vendor_id"] != "0x1002":
+        g.setdefault("kfd_correlation", KFD_CORR_NOT_EVALUATED)
         return STATUS_UNKNOWN  # чужие GPU: вердикт не наша задача на этом слое
     if g.get("driver") != "amdgpu":
+        g.setdefault("kfd_correlation", KFD_CORR_UNSUPPORTED_DRIVER)
         return STATUS_UNSUPPORTED
     if g.get("kfd_gfx"):
+        g.setdefault("kfd_correlation", KFD_CORR_MATCHED)
         return STATUS_DETECTED
     if g.get("kfd_node_present"):
+        g.setdefault("kfd_correlation", KFD_CORR_UNREADABLE)
         return STATUS_UNKNOWN
     if g.get("device_id") in RDNA1_IGPU_NO_ROCM:
+        g.setdefault("kfd_correlation", KFD_CORR_UNSUPPORTED_MODEL)
         return STATUS_UNSUPPORTED
+    g.setdefault("kfd_correlation", KFD_CORR_NOT_PRESENT)
     return STATUS_UNKNOWN
 
 
@@ -516,6 +539,13 @@ def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
     gfx и ложный compute_status=detected. Теперь алиасы распределяются по
     одному разу; лишним AMD-картам — unknown (точное соответствие dev→node
     даёт только probe E3 через /dev/kfd ioctl).
+
+    E1 (аудит неоднозначной корреляции): каждому AMD-GPU добавляется
+    diagnostic-поле kfd_correlation с ПРИЧИНОЙ исхода compute_status
+    (matched / kfd_not_present / node_properties_unreadable /
+    ambiguous_mapping / count_mismatch / gfx_not_in_whitelist / ...).
+    Статусы P4 не меняются: любой unknown остаётся unknown — поле только
+    объясняет человеку/будущему doctor-слою, почему вывод невозможен.
     """
     amd_cards = [gpu for gpu in gpus if gpu["vendor_id"] == "0x1002"]
     # Инженерная проверка C2: раньше узлы с ОТСУТСТВИЕМ поля name (битый/
@@ -527,26 +557,84 @@ def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
     named_nodes = [n for n in kfd if n.get("status") == STATUS_DETECTED]
     gfx_in_nodes = [n.get("name") for n in named_nodes if n.get("name")]
     known_gfx = [g for g in gfx_in_nodes if g in GFX_ALIASES]
-    unknown_gfx_nodes = [n for n in named_nodes if not n.get("name")]
+    # E1: узлы с именем ВНЕ whitelist — отдельный диагноз, а не общее
+    # «неоднозначно»; узлы вообще без имени — «имена недоступны» (C2).
+    offlist_gfx = [g for g in gfx_in_nodes if g not in GFX_ALIASES]
+    # E1-фикс: CPU-узел KFD ВСЕГДА без поля name (нативное свойство
+    # CRAT/CPU-узлов, см. fake-rdna2-vega/fake-rdna3-7800xt node 0).
+    # Раньше он попадал в unknown_gfx_nodes и перекрывал более точный
+    # диагноз gfx_not_in_whitelist (падение test_case2_kfd_present...).
+    # Теперь безымянные узлы считаются доказанно НЕ GPU, если properties
+    # явно перечисляет cpu_id/cpu_core_id или распарсенный cpu_count;
+    # битые/пустые properties (ни name, ни cpu-признаков) остаются в
+    # unreadable — политика C2 сохранена, unknown догадками не подменяется.
+    def _is_cpu_node(n: dict) -> bool:
+        raw = set(n.get("raw_keys", ()))
+        return "cpu_id" in raw or "cpu_core_id" in raw or "cpu_count" in n
+
+    unknown_gfx_nodes = [
+        n for n in named_nodes if not n.get("name") and not _is_cpu_node(n)
+    ]
     pool = list(known_gfx)  # каждый алиас можно использовать один раз
     # если AMD-карт столько же, сколько известных gfx-узлов, порядок cardN
     # обычно совпадает с порядком узлов — но это эвристика v0, поэтому при
     # неоднозначности (разные количества) распределение НЕ выполняем вовсе
     exact = len(pool) == len(amd_cards)
+    # E1-фикс приоритета ветвей: off-list-узлы (gfx вне whitelist) — тоже
+    # прочитанные GPU-узлы KFD. Если таких узлов вместе с известными больше,
+    # чем AMD-карт, привязка была бы догадкой → count_mismatch (ситуация 3),
+    # а НЕ gfx_not_in_whitelist: whitelist-диагноз честен только когда
+    # альтернативных gfx-кандидатов нет и связь карты с off-list-узлом
+    # тривиальна (иначе падал test_case2_offlist_alias...: при gfx9999+CPU
+    # «нечитаемый» ставился раньше «вне whitelist»).
+    total_named_gfx = len(known_gfx) + len(offlist_gfx)
     has_kfd_device = dev_exists("dev/kfd") or bool(kfd)
     for gpu in amd_cards:
-        if gpu.get("device_id") in RDNA1_IGPU_NO_ROCM:
+        if gpu.get("driver") != "amdgpu":
+            # unsupported считается по драйверу в _gpu_compute_status;
+            # корреляцию не проводим, диагноз — честный not_evaluated
+            gpu["kfd_correlation"] = KFD_CORR_NOT_EVALUATED
+            gpu["kfd_node_present"] = has_kfd_device
+        elif gpu.get("device_id") in RDNA1_IGPU_NO_ROCM:
             gpu["kfd_node_present"] = False
+            gpu["kfd_correlation"] = KFD_CORR_UNSUPPORTED_MODEL
+        elif total_named_gfx > len(amd_cards):
+            gpu["kfd_node_present"] = True
+            gpu["kfd_correlation"] = KFD_CORR_COUNT_MISMATCH
         elif pool and exact:
-            gfx = pool.pop(0)
+            if len(pool) > 1:
+                # карт и gfx-узлов поровну, но больше одного: порядок cardN
+                # ↔ node N — НЕДОКАЗАННАЯ эвристика → не привязываем (B3),
+                # но честно называем причину неоднозначности
+                gpu["kfd_node_present"] = True
+                gpu["kfd_correlation"] = KFD_CORR_AMBIGUOUS
+            else:
+                gfx = pool.pop(0)
+                gpu["kfd_node_present"] = True
+                gpu["kfd_gfx"] = gfx
+                gpu["architecture"] = GFX_ALIASES[gfx]
+                gpu["kfd_correlation"] = KFD_CORR_MATCHED
+        elif known_gfx:
+            # известные gfx-узлы есть, но численно не сходятся с картами:
+            # привязка была бы догадкой → unknown + точная причина
             gpu["kfd_node_present"] = True
-            gpu["kfd_gfx"] = gfx
-            gpu["architecture"] = GFX_ALIASES[gfx]
-        elif known_gfx or unknown_gfx_nodes:
-            # неоднозначно или имя узла неизвестно: KFD есть, привязать нельзя
+            gpu["kfd_correlation"] = KFD_CORR_COUNT_MISMATCH
+        elif unknown_gfx_nodes:
+            # KFD жив, но имена узлов нечитаемы/отсутствуют (C2)
             gpu["kfd_node_present"] = True
+            gpu["kfd_correlation"] = KFD_CORR_UNREADABLE
+        elif offlist_gfx:
+            # KFD есть, единственный gfx вне whitelist ROCm (например будущая
+            # архитектура) — это НЕ unsupported (данных о поддержке нет),
+            # честный unknown с причиной
+            gpu["kfd_node_present"] = True
+            gpu["kfd_correlation"] = KFD_CORR_NOT_IN_WHITELIST
         else:
             gpu["kfd_node_present"] = has_kfd_device
+            gpu["kfd_correlation"] = (
+                KFD_CORR_NOT_PRESENT if not has_kfd_device
+                else KFD_CORR_UNREADABLE  # /dev/kfd есть, читаемых узлов нет
+            )
 
 
 def classify(gpus: list[dict], kfd: list[dict]) -> dict:
@@ -662,8 +750,9 @@ def gpu_diagnosis(report: dict) -> list[str]:
                     d.append("  Compute: unsupported — модель вне whitelist ROCm "
                              "(проверить Vulkan-путь через probe E4)")
             else:
-                d.append("  Compute: unknown — данных достаточно для кандидата, "
-                         "требуется probe ROCm/Vulkan (E3/E4)")
+                reason = g.get("kfd_correlation", KFD_CORR_NOT_EVALUATED)
+                d.append(f"  Compute: unknown — данных достаточно для кандидата, "
+                         f"требуется probe ROCm/Vulkan (E3/E4); причина: {reason}")
     if amd:
         if tools["rocminfo"] == STATUS_UNAVAILABLE:
             d.append("ROCm: инструмент rocminfo unavailable — это НЕ означает "
