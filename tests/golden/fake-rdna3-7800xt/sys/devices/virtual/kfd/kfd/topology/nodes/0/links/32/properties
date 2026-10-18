@@ -1,0 +1,4 @@
+type 1
+from_node 0
+to_node 1
+weight 20

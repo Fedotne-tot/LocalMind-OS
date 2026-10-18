@@ -495,5 +495,141 @@ class TestRdna2WithCpuNode(unittest.TestCase):
                 self.assertIn(g[key], ALL_STATUSES)
 
 
+class TestRdna3Target7800XT(unittest.TestCase):
+    """Фикстура fake-rdna3-7800xt: целевая конфигурация RX 7800 XT + Ryzen 7 5700X.
+
+    Реалистичное KFD-дерево: CPU-узел 0 (без name, caches/links), GPU-узел 1
+    (gfx1101, mem_banks_count 2, io_links), iGPU-узел 2 (gfx1036 — связка
+    AM5 с включённым iGPU). DRM: card0 + renderD128 по общему PCI-узлу,
+    connector-каталог card0-VGA-1 и «висячий» renderD129 без vendor/device
+    (проверка R3-регрессии на расширенном дереве).
+
+    Политика доказательств (P4/P5) НЕ изменена: при двух gfx-узлах и одной
+    дискретной DRM-карте корреляция неоднозначна → честный unknown вместо
+    ложного detected; точная модель только через проверенную subsystem-пару.
+    """
+
+    FIXTURE = os.path.join(GOLDEN, "fake-rdna3-7800xt")
+
+    def setUp(self):
+        self.rep = report(self.FIXTURE)
+
+    # --- окружение -----------------------------------------------------
+    def test_cpu_ram_os_target_config(self):
+        self.assertEqual(self.rep["os_pretty_name"], "Ubuntu 24.04.1 LTS")
+        self.assertIn("Ryzen 7 5700X", self.rep["cpu"]["model"])
+        self.assertEqual(self.rep["cpu"]["cores"], 16)
+        self.assertEqual(self.rep["memory"]["status"], "detected")
+        self.assertEqual(self.rep["memory"]["mem_total_bytes"], 65789344 * 1024)
+        self.assertEqual(self.rep["loaded_modules"]["amdgpu"], "detected")
+        self.assertEqual(self.rep["loaded_modules"]["drm"], "detected")
+
+    # --- KFD topology ---------------------------------------------------
+    def test_kfd_topology_three_nodes(self):
+        nodes = {str(n["node"]): n for n in self.rep["kfd_nodes"]}
+        self.assertEqual(set(nodes), {"0", "1", "2"})
+        # CPU-узел: properties без поля name (как в fake-rdna2-vega/C2)
+        self.assertNotIn("name", nodes["0"])
+        gpu_node = next(n for n in self.rep["kfd_nodes"]
+                        if str(n["node"]) == "1")
+        self.assertEqual(gpu_node["name"], "gfx1101")
+        # сырые ключи GPU-узла сохраняются для будущего probe-слоя (E3)
+        for k in ("vdhip", "simd_count", "mem_banks_count", "io_links_count"):
+            self.assertIn(k, gpu_node["raw_keys"])
+
+    def test_classification_collects_both_known_aliases(self):
+        c = self.rep["classification"]
+        self.assertEqual(sorted(c["known_gfx_aliases_in_kfd"]),
+                         ["gfx1036", "gfx1101"])
+        self.assertTrue(c["kfd_device_present"])
+        self.assertTrue(c["amd_gpu_detected"])
+        self.assertTrue(c["amdgpu_driver_bound"])
+
+    # --- DRM-карта ------------------------------------------------------
+    def test_drm_card_fields_and_render_node(self):
+        gpus = [g for g in self.rep["drm_gpus"]]
+        # card1 внутри pci.../drm/ и «висячий» renderD129 не порождают карт
+        self.assertEqual(len(gpus), 1)
+        g = gpus[0]
+        self.assertEqual(g["card"], "card0")
+        self.assertEqual(g["vendor_id"], "0x1002")
+        self.assertEqual(g["device_id"], "0x7480")
+        self.assertEqual(g["driver"], "amdgpu")
+        self.assertEqual(g["render_node"], "sys/class/drm/renderD128")
+        self.assertEqual(g["pci_path"], "0000:00:01.1")
+        self.assertEqual(g["vram_bytes"], 17163096064)  # ~16 GiB из фикстуры
+        self.assertEqual(g["vram_status"], "detected")
+
+    def test_honest_states_without_subsystem_evidence(self):
+        """Без подтверждённой subsystem-пары: model/compute — unknown, не выдумка."""
+        g = self.rep["drm_gpus"][0]
+        self.assertEqual(g["model"], "AMD Radeon Graphics")  # обобщённый label
+        self.assertEqual(g["model_status"], "unknown")       # D3/B2
+        # два gfx-узла vs одна карта -> pool(2) != amd_cards(1): не угадываем
+        self.assertNotIn("kfd_gfx", g)                      # B3: алиас не приписан
+        self.assertTrue(g["kfd_node_present"])              # C2: KFD всё же есть
+        self.assertEqual(g["compute_status"], "unknown")    # ждёт probe E3/E4
+        self.assertNotEqual(g["compute_status"], "unsupported")
+
+    def test_verdict_candidate_but_no_pass(self):
+        c = self.rep["classification"]
+        self.assertEqual(c["preliminary_verdict"], "ROCM_CANDIDATE")
+        blob = json.dumps(self.rep)
+        self.assertNotIn('"PASS"', blob)                    # P4
+        self.assertNotIn("supported\": true", blob)
+
+    def test_all_statuses_valid_enum(self):
+        for g in self.rep["drm_gpus"]:
+            for key in ("driver_status", "vram_status", "model_status",
+                        "compute_status"):
+                self.assertIn(g[key], ALL_STATUSES)
+        for n in self.rep["kfd_nodes"]:
+            self.assertIn(n["status"], ALL_STATUSES)
+
+    # --- путь к точному имени модели ------------------------------------
+    def test_exact_model_via_reference_subsystem_pair(self):
+        """Табличный ключ 0x1002:0x7480:0x0732:0x0008 даёт точное имя и RDNA3."""
+        import shutil, tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fx = os.path.join(tmp, "fx")
+        shutil.copytree(self.FIXTURE, fx, symlinks=True)
+        dev = os.path.join(fx, "sys/devices/pci0000:00/0000:00:01.1")
+        with open(os.path.join(dev, "subsystem_vendor"), "w") as fh:
+            fh.write("0x0732\n")
+        with open(os.path.join(dev, "subsystem_device"), "w") as fh:
+            fh.write("0x0008\n")
+        rep = report(fx)
+        g = rep["drm_gpus"][0]
+        self.assertEqual(g["model"], "Radeon RX 7800 XT")
+        self.assertEqual(g["model_status"], "detected")
+        self.assertEqual(g["subsystem_key"], "0x1002:0x7480:0x0732:0x0008")
+        # политика НЕ меняется: неоднозначная корреляция остаётся unknown
+        self.assertEqual(g["compute_status"], "unknown")
+
+    def test_single_gpu_node_correlates_gfx1101_rdna3(self):
+        """Если iGPU-узел убрать, единственная карта честно получает gfx1101/RDNA3."""
+        import shutil, tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fx = os.path.join(tmp, "fx")
+        shutil.copytree(self.FIXTURE, fx, symlinks=True)
+        shutil.rmtree(os.path.join(
+            fx, "sys/devices/virtual/kfd/kfd/topology/nodes/2"))
+        rep = report(fx)
+        g = rep["drm_gpus"][0]
+        self.assertEqual(g["kfd_gfx"], "gfx1101")
+        self.assertEqual(g["architecture"], "RDNA3")
+        self.assertEqual(g["compute_status"], "detected")  # кандидат ROCm
+        blob = json.dumps(rep)
+        self.assertNotIn('"PASS"', blob)                   # detected != PASS
+
+    def test_doctor_mode_on_target_fixture(self):
+        proc = run_detect(self.FIXTURE, ["--doctor"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("VRAM: 16368 MiB (detected)", proc.stdout)
+        self.assertIn("unknown", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

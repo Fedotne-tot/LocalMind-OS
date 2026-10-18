@@ -1,0 +1,6 @@
+cpu_id 0
+sib_lo 0
+sib_hi 0
+processor_count 16
+cache_count 3
+io_links_count 1

@@ -1,0 +1,4 @@
+amdgpu 13961216 21 amdgpu_ttm,amd_iommu_v2,drm_ttm_helper,Live 0x0
+drm 634880 8 amdgpu,drm_kms_helper,Live 0x0
+amd_iommu_v2 20480 1 amdgpu,Live 0x0
+i2c_algo_bit 16384 1 amdgpu,Live 0x0
