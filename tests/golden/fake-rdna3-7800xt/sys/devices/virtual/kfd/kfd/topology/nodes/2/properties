@@ -1,0 +1,14 @@
+name gfx1036
+unique_id 12885099072
+vdhip 1.1
+simd_count 256
+mem_banks_count 1
+caches_count 2
+io_links_count 1
+cpu_core_id 0
+max_waves_per_simd 16
+lds_size_in_kb 64
+wave_front_size 32
+array_count 1
+shader_engines_count 1
+cu_count 4

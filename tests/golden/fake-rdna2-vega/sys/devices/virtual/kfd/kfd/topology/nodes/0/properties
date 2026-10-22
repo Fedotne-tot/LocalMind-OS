@@ -1,0 +1,6 @@
+cpu_id 0
+performance_limits 0
+num_cpus 12
+sib_lo 0
+sib_hi 0
+cache_count 3
