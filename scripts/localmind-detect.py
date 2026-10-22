@@ -56,6 +56,30 @@ KFD_CORR_AMBIGUOUS = "ambiguous_mapping"      # unknown: карт и gfx-узл�
 KFD_CORR_COUNT_MISMATCH = "count_mismatch"    # unknown: количество карт и gfx-узлов не сходится
 KFD_CORR_NOT_IN_WHITELIST = "gfx_not_in_whitelist"  # unknown: gfx вне whitelist ROCm
 KFD_CORR_NOT_EVALUATED = "not_evaluated"      # не AMD / корреляция не проводилась
+# E3-lite (docs/PROBE-E3-DESIGN.md §4.0): каноническая привязка по PCI BDF /
+# drm_render_minor и новый честный диагноз противоречия источников.
+KFD_CORR_CONFLICT = "canonical_id_conflict"   # unknown: ID указывают на разные узлы
+KFD_CORR_SINGLE_SOURCE = "single_source_match"  # unknown: совпал ОДИН канонический
+# источник (BDF ИЛИ render-minor); одинарное совпадение — НЕ доказательство
+# тождества устройства (design §4.0/§7.1), matched только при двух источниках
+# E3-lite: эвристика 1:1 (единственный gfx-узел ↔ единственная AMD-карта)
+# получает ОТДЕЛЬНЫЙ диагноз — это всё ещё unknown-proof, а не доказательство;
+# matched резервируется за двойным каноническим согласием local_id+render_minor.
+KFD_CORR_HEURISTIC_1TO1 = "heuristic_1to1"
+EVIDENCE_PCI_BDF = "pci_bdf"                  # local_id == pci_path карты
+EVIDENCE_RENDER_MINOR = "render_minor"        # drm_render_minor == номер renderD карты
+
+# Формат PCI BDF «DDDD:BB:DD.F» (домен 4 hex, шина/устройство 2 hex, func 0-7)
+PCI_BDF_RE = __import__("re").compile(
+    r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]")
+
+
+def _pci_domain_bus(pci_path: str | None) -> tuple[str, int] | None:
+    """(domain, bus) из строки вида '0000:05:00.0'; None — если не BDF."""
+    if not pci_path or not PCI_BDF_RE.fullmatch(pci_path):
+        return None
+    dom, bus = pci_path.split(":")[:2]
+    return dom.lower(), int(bus, 16)
 
 # PCI vendor IDs (публичные данные PCI SIG / upstream hwdata pci.ids)
 VENDOR_IDS = {
@@ -282,6 +306,12 @@ def detect_drm_gpus(subsystem_names: dict | None = None) -> list[dict]:
         entry["model_status"] = _model_status(entry["model"])
         # render node (DRM renderD для Vulkan/compute-доступа к карте)
         entry["render_node"] = renders.get(pci_path)
+        # E3-lite: канонический номер render-узла (128 из sys/class/drm/renderD128);
+        # сопоставляется с drm_render_minor GPU-узла KFD (§4.0 дизайна)
+        if entry["render_node"]:
+            mnum = os.path.basename(entry["render_node"]).removeprefix("renderD")
+            if mnum.isdigit():
+                entry["render_minor"] = int(mnum)
         mem_info = read_file(os.path.join(base, "mem_info_vram_total"))
         if mem_info is None:
             # файла нет: у дискретных amdgpu он есть; у iGPU VRAM — часть RAM
@@ -311,6 +341,12 @@ def _gpu_compute_status(g: dict) -> str:
                  недостаточно для вывода (требует probe E3/E4).
     E1: исход записывается в diagnostic-поле kfd_correlation (причина),
         сами статусы P4 не меняются.
+    E3-lite: поле уже заполнено канонической корреляцией correlate_by_pci_or_minor
+        (вызывается до пересчёта статусов) — setdefault сохраняет этот диагноз;
+        kfd_gfx без канонического evidence остаётся только у эвристики 1:1 (E1).
+        Ветвь kfd_gfx проверяется РАНЬШЕ kfd_node_present, поэтому двойной
+        matched (kfd_gfx + evidence) даёт detected, а single_source/conflict
+        (без kfd_gfx) — честный unknown с точной причиной.
     """
     if g["vendor_id"] != "0x1002":
         g.setdefault("kfd_correlation", KFD_CORR_NOT_EVALUATED)
@@ -319,9 +355,19 @@ def _gpu_compute_status(g: dict) -> str:
         g.setdefault("kfd_correlation", KFD_CORR_UNSUPPORTED_DRIVER)
         return STATUS_UNSUPPORTED
     if g.get("kfd_gfx"):
-        g.setdefault("kfd_correlation", KFD_CORR_MATCHED)
+        # E3-lite: detected по gfx-алиасу возможен и при эвристике 1:1 —
+        # diagnosis (kfd_correlation) различает доказанность; статусы P4 те же.
+        # ВНИМАНИЕ: у карт с КАНОНИЧЕСКИМ диагнозом kfd_gfx не выставляется
+        # вовсе (кроме двойного matched), поэтому ветвь unreadable их не
+        # касается — setdefault ниже сохраняет точную причину E3-lite.
+        ev = g.get("kfd_evidence")
+        corr = KFD_CORR_MATCHED if ev else KFD_CORR_HEURISTIC_1TO1
+        g.setdefault("kfd_correlation", corr)
         return STATUS_DETECTED
     if g.get("kfd_node_present"):
+        # E3-lite: канонический диагноз (conflict/single_source/offlist),
+        # поставленный correlate_by_pci_or_minor, НЕ перекрывается общим
+        # «unreadable» — setdefault сохраняет точную причину
         g.setdefault("kfd_correlation", KFD_CORR_UNREADABLE)
         return STATUS_UNKNOWN
     if g.get("device_id") in RDNA1_IGPU_NO_ROCM:
@@ -335,6 +381,21 @@ def _gpu_compute_status(g: dict) -> str:
 # (поддержка начата с RDNA2; источник: docs.amd.com/rocm support matrix).
 # Список расширяется/сужается ТОЛЬКО по данным golden-отчётов (POLICY P5).
 RDNA1_IGPU_NO_ROCM = {"0x1638"}
+
+
+def _read_kv_file(path: str) -> dict:
+    """Парсер sysfs-файлов формата «key value» (properties nodes/mem_banks/links)."""
+    out = {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            content = fh.read()
+    except OSError:
+        return out
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            out[parts[0]] = parts[1]
+    return out
 
 
 def detect_kfd_nodes() -> list[dict]:
@@ -366,6 +427,46 @@ def detect_kfd_nodes() -> list[dict]:
         entry = {"node": node, "status": STATUS_DETECTED}
         if "name" in props:
             entry["name"] = props["name"]
+        # E3-lite (§4.0 дизайна): канонические идентификаторы GPU-узла KFD.
+        # local_id — PCI BDF узла в нотации CRAT (например "0000:03:00.0");
+        # drm_render_minor — номер renderD этой карты; unique_id — стабильный
+        # ID процессора из CRAT. Раньше они терялись в raw_keys, теперь
+        # сохраняются как есть (сырое sysfs-значение) и используются только
+        # для сверки с DRM-стороной; совпадение само по себе ещё не
+        # «доказательство одного устройства» — см. correlate_by_pci_or_minor.
+        for canon_key in ("local_id", "drm_render_minor", "unique_id"):
+            if canon_key in props:
+                entry[canon_key] = props[canon_key]
+        # mem_banks/*/properties и links/*/properties — данные УЖЕ есть на
+        # диске фикстур (design §1); читаем минимальное резюме, без интерпретации
+        node_dir = os.path.join(top, node)
+        banks = []
+        bdir = os.path.join(node_dir, "mem_banks")
+        if os.path.isdir(bdir):
+            for b in sorted(os.listdir(bdir), key=lambda x: int(x) if x.isdigit() else 999):
+                bp = _read_kv_file(os.path.join(bdir, b, "properties"))
+                banks.append({
+                    "index": b,
+                    "size_bytes": bp.get("size"),
+                    "width": bp.get("width"),
+                    "type": bp.get("heap_type"),
+                })
+        if banks:
+            entry["mem_banks"] = banks
+        links = []
+        ldir = os.path.join(node_dir, "links")
+        if os.path.isdir(ldir):
+            for l in sorted(os.listdir(ldir), key=lambda x: int(x) if x.isdigit() else 999):
+                lp = _read_kv_file(os.path.join(ldir, l, "properties"))
+                links.append({
+                    "link_id": l,
+                    "type": lp.get("type"),
+                    "from_node": lp.get("from_node"),
+                    "to_node": lp.get("to_node"),
+                    "weight": lp.get("weight"),
+                })
+        if links:
+            entry["io_links"] = links
         if "cpu_count" in props:
             try:
                 entry["cpu_count"] = int(props["cpu_count"])
@@ -532,6 +633,102 @@ def detect_stack_presence() -> dict:
     return stacks
 
 
+def _norm_bdf(value) -> str | None:
+    """Нормализация PCI BDF к виду DDDD:BB:DD.F (lowercase).
+
+    DRM-сторона хранит путь realpath (/sys/.../0000:05:00.0), KFD-сторона —
+    local_id из CRAT. Формат local_id на реальном ядре НЕ подтверждён
+    (design §7.1), поэтому допускаем два известных представления: полный BDF
+    и «bus-only» нотацию старых CRAT (например "5" = шина 0x05 при domain 0,
+    dev/func 0). Значение, не похожее ни на что PCI, → None (не гадаем)."""
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    import re
+    m = re.fullmatch(r"([0-9a-f]{4}):([0-9a-f]{2}):([0-9a-f]{2})\.([0-7])", s)
+    if m:
+        return s
+    if re.fullmatch(r"[0-9a-f]{1,2}", s):          # bus-only (hex или dec вид)
+        try:
+            bus = int(s, 16)
+        except ValueError:
+            return None
+        return f"0000:{bus:02x}:00.0"
+    return None
+
+
+def correlate_by_pci_or_minor(gpus: list[dict], kfd: list[dict]) -> None:
+    """E3-lite (§4.0 дизайна): каноническая привязка GPU↔KFD ДО эвристики.
+
+    Ключи сопоставления (только явно прочитанные sysfs-значения):
+      pci_bdf       — pci_path карты == local_id узла (после нормализации);
+      render_minor  — номер renderD карты == drm_render_minor узла.
+    Инвариант P4: ни одно поле само по себе ещё НЕ доказывает, что это ОДНО
+    устройство. Поэтому matched выдаётся ТОЛЬКО при двойном согласии обоих
+    независимых источников (BDF и render-minor указывают на один узел,
+    evidence=[pci_bdf, render_minor]). Одинарное совпадение — отдельный
+    диагноз single_source (unknown, кандидатура видна, доказательства нет).
+    Два источника указывают на РАЗНЫЕ узлы — canonical_id_conflict (unknown).
+    Алиас вне whitelist при доказанной привязке — gfx_not_in_whitelist
+    (detected-статус не даёт, unsupported НЕ выводим). Эвристика E1 к
+    картам с любым каноническим диагнозом не применяется (см.
+    correlate_kfd_to_gpus); unknown догадками не подменяются.
+    """
+    amd_cards = [g for g in gpus if g["vendor_id"] == "0x1002"
+                 and g.get("driver") == "amdgpu"]
+    nodes = [n for n in kfd if n.get("status") == STATUS_DETECTED and n.get("name")]
+    by_bdf: dict[str, list[dict]] = {}
+    by_minor: dict[str, list[dict]] = {}
+    for n in nodes:
+        b = _norm_bdf(n.get("local_id"))
+        if b:
+            by_bdf.setdefault(b, []).append(n)
+        m = n.get("drm_render_minor")
+        if m is not None and str(m).isdigit():
+            by_minor.setdefault(str(m), []).append(n)
+    for gpu in amd_cards:
+        cand_bdf = {n["node"] for n in by_bdf.get(_norm_bdf(gpu.get("pci_path")) or "", ())} \
+            if gpu.get("pci_path") else set()
+        minor = gpu.get("render_minor")
+        cand_min = {n["node"] for n in by_minor.get(str(minor), ())} \
+            if minor is not None else set()
+        if not cand_bdf and not cand_min:
+            continue  # канонических данных нет — решение остаётся за эвристикой E1
+        both = cand_bdf & cand_min
+        gpu["kfd_node_present"] = True
+        if len(cand_bdf) > 1 or len(cand_min) > 1 or (cand_bdf and cand_min and not both):
+            # противоречие/неоднозначность источников: меньше знаешь — крепче
+            # спишь (§5 дизайна); candidate-узлы сохраняем в отчёте как факты
+            gpu["kfd_correlation"] = KFD_CORR_CONFLICT
+            gpu["kfd_candidate_nodes"] = sorted(cand_bdf | cand_min)
+            continue
+        node_id = both.pop() if both else (cand_bdf | cand_min).pop()
+        node = next(n for n in nodes if n["node"] == node_id)
+        gfx = node.get("name")
+        double = bool({node_id} & cand_bdf & cand_min)
+        if gfx not in GFX_ALIASES:
+            # узел найден, но алиас вне whitelist — unsupported НЕ выводим;
+            # статус unknown даёт _gpu_compute_status (kfd_gfx не ставим)
+            gpu["kfd_correlation"] = KFD_CORR_NOT_IN_WHITELIST
+            gpu["kfd_node"] = node_id
+            continue
+        if double:
+            gpu["kfd_gfx"] = gfx
+            gpu["architecture"] = GFX_ALIASES[gfx]
+            gpu["kfd_correlation"] = KFD_CORR_MATCHED
+            gpu["kfd_node"] = node_id
+            gpu["kfd_evidence"] = [EVIDENCE_PCI_BDF, EVIDENCE_RENDER_MINOR]
+        else:
+            # единственный источник (BDF ИЛИ minor) — привязку НЕ выполняем:
+            # семантика local_id/drm_render_minor на реальном ядре не
+            # подтверждена (design §7.1); unknown + честная кандидатура
+            gpu["kfd_correlation"] = KFD_CORR_SINGLE_SOURCE
+            gpu["kfd_candidate_node"] = node_id
+            gpu["kfd_candidate_gfx"] = gfx
+
+
 def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
     """Связывает DRM-GPU с KFD-узлами по gfx-алиасам (in-place).
 
@@ -547,7 +744,15 @@ def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
     ambiguous_mapping / count_mismatch / gfx_not_in_whitelist / ...).
     Статусы P4 не меняются: любой unknown остаётся unknown — поле только
     объясняет человеку/будущему doctor-слою, почему вывод невозможен.
+
+    E3-lite (docs/PROBE-E3-DESIGN.md §4.0): каноническая привязка
+    correlate_by_pci_or_minor выполняется ДО эвристики 1:1; карты с
+    доказанным каноническим диагнозом в эвристическом проходе не участвуют.
     """
+    # E3-lite (§4.0 дизайна): каноническая корреляция выполняется ДО эвристики;
+    # карты, получившие доказанную привязку/диагноз по canonical-ID, в
+    # эвристическом проходе не участвуют (эвристика — запасной путь).
+    correlate_by_pci_or_minor(gpus, kfd)
     amd_cards = [gpu for gpu in gpus if gpu["vendor_id"] == "0x1002"]
     # Инженерная проверка C2: раньше узлы с ОТСУТСТВИЕМ поля name (битый/
     # нечитаемый properties, старые ядра без CRAT) молча отбрасывались —
@@ -590,7 +795,23 @@ def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
     # «нечитаемый» ставился раньше «вне whitelist»).
     total_named_gfx = len(known_gfx) + len(offlist_gfx)
     has_kfd_device = dev_exists("dev/kfd") or bool(kfd)
+    # E3-lite (§4.0 дизайна): каноническая корреляция выполняется ДО эвристики;
+    # карты, получившие доказанную привязку/диагноз по canonical-ID, в
+    # эвристическом проходе не участвуют (эвристика — запасной путь).
+    correlate_by_pci_or_minor(gpus, kfd)
     for gpu in amd_cards:
+        corr = gpu.get("kfd_correlation")
+        if corr and corr != KFD_CORR_NOT_IN_WHITELIST:
+            # уже matched/conflict/single_source по каноническим ID —
+            # эвристика к доказанным диагнозам не применяется (P4)
+            continue
+        if corr == KFD_CORR_NOT_IN_WHITELIST:
+            # E3-lite: off-list-алиас от канонического кандидата — это ТОЧНОЕ
+            # имя узла, а не догадка про gfx карты; оставляем его в kfd_node,
+            # но чистим диагноз для пересчёта эвристикой (E1 даёт тот же
+            # gfx_not_in_whitelist при тривиальной связи, ничего не ослабляя)
+            gpu["kfd_node"] = None
+            del gpu["kfd_correlation"]
         if gpu.get("driver") != "amdgpu":
             # unsupported считается по драйверу в _gpu_compute_status;
             # корреляцию не проводим, диагноз — честный not_evaluated
@@ -614,7 +835,10 @@ def correlate_kfd_to_gpus(gpus: list[dict], kfd: list[dict]) -> None:
                 gpu["kfd_node_present"] = True
                 gpu["kfd_gfx"] = gfx
                 gpu["architecture"] = GFX_ALIASES[gfx]
-                gpu["kfd_correlation"] = KFD_CORR_MATCHED
+                # E3-lite: это эвристика 1:1, а НЕ доказанная привязка —
+                # отдельный диагноз (без kfd_evidence), чтобы не смешивать
+                # с каноническим matched из correlate_by_pci_or_minor
+                gpu["kfd_correlation"] = KFD_CORR_HEURISTIC_1TO1
         elif known_gfx:
             # известные gfx-узлы есть, но численно не сходятся с картами:
             # привязка была бы догадкой → unknown + точная причина
@@ -653,9 +877,13 @@ def summarize_kfd_correlation(gpus: list[dict]) -> str:
     for r in reasons:
         if r == STATUS_ERROR:
             return STATUS_ERROR
-    for bucket in (KFD_CORR_AMBIGUOUS, KFD_CORR_COUNT_MISMATCH,
+    for bucket in (KFD_CORR_CONFLICT, KFD_CORR_AMBIGUOUS, KFD_CORR_COUNT_MISMATCH,
                    KFD_CORR_UNREADABLE, KFD_CORR_NOT_IN_WHITELIST,
-                   KFD_CORR_NOT_PRESENT, KFD_CORR_MATCHED):
+                   KFD_CORR_NOT_PRESENT, KFD_CORR_MATCHED,
+                   # E3-lite: эвристика 1:1 и одинарное каноническое совпадение
+                   # в сводке — отдельные токены; matched остаётся только за
+                   # двойным каноническим доказательством
+                   KFD_CORR_HEURISTIC_1TO1, KFD_CORR_SINGLE_SOURCE):
         if bucket in reasons:
             return bucket
     return KFD_CORR_NOT_EVALUATED
@@ -822,6 +1050,10 @@ DOCTOR_SUMMARY_TOKENS = {
     KFD_CORR_UNSUPPORTED_MODEL: "UNSUPPORTED-MODEL",
     KFD_CORR_UNSUPPORTED_DRIVER: "DRIVER-NOT-AMDGPU",
     KFD_CORR_NOT_EVALUATED: "NOT-EVALUATED",
+    # E3-lite: новые диагнозы — оба unknown, то есть НЕ OK (P4)
+    KFD_CORR_CONFLICT: "CONFLICT",
+    KFD_CORR_SINGLE_SOURCE: "SINGLE-SOURCE",
+    KFD_CORR_HEURISTIC_1TO1: "HEURISTIC-1TO1",
 }
 
 
@@ -928,6 +1160,9 @@ def doctor(report: dict) -> tuple[int, str]:
     c = report["classification"]
     amd = [g for g in report["drm_gpus"] if g["vendor_id"] == "0x1002"]
     summary = c.get("kfd_correlation_summary", KFD_CORR_NOT_EVALUATED)
+    # E3-lite: OK (exit 0) — только при КАНОНЧЕСКИ доказанной корреляции
+    # (matched по local_id/render_minor). Эвристика heuristic_1to1 остаётся
+    # INCOMPLETE: привязка не доказана, «среда работает» не заявляем (P4).
     all_detected = bool(amd) and all(
         g["compute_status"] == STATUS_DETECTED for g in amd) and summary == \
         KFD_CORR_MATCHED
